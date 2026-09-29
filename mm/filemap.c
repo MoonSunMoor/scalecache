@@ -3872,6 +3872,47 @@ skip:
 	return NULL;
 }
 
+static struct folio *cc_next_uptodate_folio(struct cc_xa_state *xas,
+		struct address_space *mapping, pgoff_t end_pgoff)
+{
+	struct folio *folio = cc_xas_next_entry(xas, end_pgoff);
+	unsigned long max_idx;
+
+	do {
+		if (!folio)
+			return NULL;
+		if (cc_xas_retry(xas, folio))
+			continue;
+		if (cc_xa_is_value(folio))
+			continue;
+		if (!folio_try_get(folio))
+			continue;
+		if (folio_test_locked(folio))
+			goto skip;
+		/* Has the page moved or been split? */
+		if (unlikely(folio != cc_xas_reload(xas)))
+			goto skip;
+		if (!folio_test_uptodate(folio) || folio_test_readahead(folio))
+			goto skip;
+		if (!folio_trylock(folio))
+			goto skip;
+		if (folio->mapping != mapping)
+			goto unlock;
+		if (!folio_test_uptodate(folio))
+			goto unlock;
+		max_idx = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE);
+		if (xas->xa_index >= max_idx)
+			goto unlock;
+		return folio;
+unlock:
+		folio_unlock(folio);
+skip:
+		folio_put(folio);
+	} while ((folio = cc_xas_next_entry(xas, end_pgoff)) != NULL);
+
+	return NULL;
+}
+
 /*
  * Map page range [start_page, start_page + nr_pages) of folio.
  * start_page is gotten from start by folio_page(folio, start)
@@ -3986,6 +4027,9 @@ out:
 	return ret;
 }
 
+static vm_fault_t cc_filemap_map_pages(struct vm_fault *vmf,
+		pgoff_t start_pgoff, pgoff_t end_pgoff);
+
 vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 			     pgoff_t start_pgoff, pgoff_t end_pgoff)
 {
@@ -3999,6 +4043,9 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 	vm_fault_t ret = 0;
 	unsigned long rss = 0;
 	unsigned int nr_pages = 0, folio_type;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_filemap_map_pages(vmf, start_pgoff, end_pgoff);
 
 	/*
 	 * Recalculate end_pgoff based on file_end before calling
@@ -4091,6 +4138,112 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL(filemap_map_pages);
+
+static vm_fault_t cc_filemap_map_pages(struct vm_fault *vmf,
+		pgoff_t start_pgoff, pgoff_t end_pgoff)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct file *file = vma->vm_file;
+	struct address_space *mapping = file->f_mapping;
+	pgoff_t file_end, last_pgoff = start_pgoff;
+	unsigned long addr;
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), start_pgoff);
+	struct folio *folio;
+	vm_fault_t ret = 0;
+	unsigned long rss = 0;
+	unsigned int nr_pages = 0, folio_type;
+
+	/*
+	 * Recalculate end_pgoff based on file_end before calling
+	 * next_uptodate_folio() to avoid races with concurrent
+	 * truncation.
+	 */
+	file_end = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE) - 1;
+	end_pgoff = min(end_pgoff, file_end);
+
+	//rcu_read_lock();
+	folio = cc_next_uptodate_folio(&xas, mapping, end_pgoff);
+	if (!folio)
+		goto out;
+
+	/*
+	 * Do not allow to map with PMD across i_size to preserve
+	 * SIGBUS semantics.
+	 *
+	 * Make an exception for shmem/tmpfs that for long time
+	 * intentionally mapped with PMDs across i_size.
+	 */
+	if ((file_end >= folio_next_index(folio) || shmem_mapping(mapping)) &&
+	    filemap_map_pmd(vmf, folio, start_pgoff)) {
+		ret = VM_FAULT_NOPAGE;
+		goto out;
+	}
+
+	addr = vma->vm_start + ((start_pgoff - vma->vm_pgoff) << PAGE_SHIFT);
+	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, addr, &vmf->ptl);
+	if (!vmf->pte) {
+		folio_unlock(folio);
+		folio_put(folio);
+		goto out;
+	}
+
+	folio_type = mm_counter_file(folio);
+	do {
+		unsigned long end;
+		vm_fault_t map_ret;
+
+		addr += (xas.xa_index - last_pgoff) << PAGE_SHIFT;
+		vmf->pte += xas.xa_index - last_pgoff;
+		last_pgoff = xas.xa_index;
+		end = folio_next_index(folio) - 1;
+		nr_pages = min(end, end_pgoff) - xas.xa_index + 1;
+
+		if (!folio_test_large(folio)) {
+			map_ret = filemap_map_order0_folio(vmf, folio, addr,
+							   &rss);
+		} else {
+			unsigned long start = xas.xa_index - folio->index;
+
+			map_ret = filemap_map_folio_range(vmf, folio, start,
+							  addr, nr_pages, &rss,
+							  file_end);
+		}
+		ret |= map_ret;
+
+		/*
+		 * If there are too many folios that are recently evicted
+		 * in a file, they will probably continue to be evicted.
+		 * In such situation, read-ahead is only a waste of IO.
+		 * Don't decrease mmap_miss in this scenario to make sure
+		 * we can stop read-ahead.
+		 *
+		 * VM_SEQ_READ and VM_EXEC mappings skip the mmap_miss
+		 * increment in do_sync_mmap_readahead(), so skip the
+		 * decrement here as well to keep the counter symmetric.
+		 */
+		if ((map_ret & VM_FAULT_NOPAGE) &&
+		    !(vmf->flags & FAULT_FLAG_TRIED) &&
+		    !folio_test_workingset(folio) &&
+		    !(vma->vm_flags & (VM_SEQ_READ | VM_EXEC))) {
+			unsigned short mmap_miss;
+
+			mmap_miss = READ_ONCE(file->f_ra.mmap_miss);
+			if (mmap_miss)
+				WRITE_ONCE(file->f_ra.mmap_miss,
+					   mmap_miss - 1);
+		}
+
+		folio_unlock(folio);
+	} while ((folio = cc_next_uptodate_folio(&xas, mapping, end_pgoff)) != NULL);
+	add_mm_counter(vma->vm_mm, folio_type, rss);
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	trace_mm_filemap_map_pages(mapping, start_pgoff, end_pgoff);
+out:
+	//rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
+
+	return ret;
+}
 
 vm_fault_t filemap_page_mkwrite(struct vm_fault *vmf)
 {
