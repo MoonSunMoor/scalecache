@@ -2512,6 +2512,9 @@ static void shrink_readahead_size_eio(struct file_ra_state *ra)
 	ra->ra_pages /= 4;
 }
 
+static void cc_filemap_get_read_batch(struct address_space *mapping,
+		pgoff_t index, pgoff_t max, struct folio_batch *fbatch);
+
 /*
  * filemap_get_read_batch - Get a batch of folios for read
  *
@@ -2526,6 +2529,11 @@ static void filemap_get_read_batch(struct address_space *mapping,
 {
 	XA_STATE(xas, &mapping->i_pages, index);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas)) {
+		cc_filemap_get_read_batch(mapping, index, max, fbatch);
+		return;
+	}
 
 	rcu_read_lock();
 	for (folio = xas_load(&xas); folio; folio = xas_next(&xas)) {
@@ -2555,6 +2563,43 @@ retry:
 		xas_reset(&xas);
 	}
 	rcu_read_unlock();
+}
+
+static void cc_filemap_get_read_batch(struct address_space *mapping,
+		pgoff_t index, pgoff_t max, struct folio_batch *fbatch)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+	struct folio *folio;
+
+	//rcu_read_lock();
+	for (folio = cc_xas_load(&xas, true); folio; folio = cc_xas_next(&xas)) {
+		if (cc_xas_retry(&xas, folio))
+			continue;
+		if (xas.xa_index > max || cc_xa_is_value(folio))
+			break;
+		if (cc_xa_is_sibling(folio))
+			break;
+		if (!folio_try_get(folio))
+			goto retry;
+
+		if (unlikely(folio != cc_xas_reload(&xas)))
+			goto put_folio;
+
+		if (!folio_batch_add(fbatch, folio))
+			break;
+		if (!folio_test_uptodate(folio))
+			break;
+		if (folio_test_readahead(folio))
+			break;
+		cc_xas_advance(&xas, folio_next_index(folio) - 1);
+		continue;
+put_folio:
+		folio_put(folio);
+retry:
+		cc_xas_reset(&xas);
+	}
+	// rcu_read_unlock();
+	cc_xas_reset(&xas);
 }
 
 static int filemap_read_folio(struct file *file, filler_t filler,
