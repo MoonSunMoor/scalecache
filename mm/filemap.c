@@ -3195,11 +3195,16 @@ static void shrink_readahead_size_eio(struct file_ra_state *ra)
  * folio in the batch may have the readahead flag set or the uptodate flag
  * clear so that the caller can take the appropriate action.
  */
+static void cc_filemap_get_read_batch(struct address_space *mapping,
+		pgoff_t index, pgoff_t max, struct folio_batch *fbatch);
 static void filemap_get_read_batch(struct address_space *mapping,
 		pgoff_t index, pgoff_t max, struct folio_batch *fbatch)
 {
 	XA_STATE(xas, &mapping->i_pages, index);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_filemap_get_read_batch(mapping, index, max, fbatch);
 
 	rcu_read_lock();
 	for (folio = xas_load(&xas); folio; folio = xas_next(&xas)) {
@@ -3229,6 +3234,43 @@ retry:
 		xas_reset(&xas);
 	}
 	rcu_read_unlock();
+}
+
+static void cc_filemap_get_read_batch(struct address_space *mapping,
+		pgoff_t index, pgoff_t max, struct folio_batch *fbatch)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+	struct folio *folio;
+
+	//rcu_read_lock();
+	for (folio = cc_xas_load(&xas, true); folio; folio = cc_xas_next(&xas)) {
+		if (cc_xas_retry(&xas, folio))
+			continue;
+		if (xas.xa_index > max || xa_is_value(folio))
+			break;
+		if (xa_is_sibling(folio))
+			break;
+		if (!folio_try_get_rcu(folio))
+			goto retry;
+
+		if (unlikely(folio != cc_xas_reload(&xas)))
+			goto put_folio;
+
+		if (!folio_batch_add(fbatch, folio))
+			break;
+		if (!folio_test_uptodate(folio))
+			break;
+		if (folio_test_readahead(folio))
+			break;
+		cc_xas_advance(&xas, folio_next_index(folio) - 1);
+		continue;
+put_folio:
+		folio_put(folio);
+retry:
+		cc_xas_reset(&xas);
+	}
+	// rcu_read_unlock();
+	cc_xas_reset(&xas);
 }
 
 static int filemap_read_folio(struct file *file, filler_t filler,
