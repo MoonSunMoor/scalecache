@@ -477,12 +477,17 @@ EXPORT_SYMBOL(filemap_flush);
  * Return: %true if at least one page exists in the specified range,
  * %false otherwise.
  */
+bool cc_filemap_range_has_page(struct address_space *mapping,
+			   loff_t start_byte, loff_t end_byte);
 bool filemap_range_has_page(struct address_space *mapping,
 			   loff_t start_byte, loff_t end_byte)
 {
 	struct folio *folio;
 	XA_STATE(xas, &mapping->i_pages, start_byte >> PAGE_SHIFT);
 	pgoff_t max = end_byte >> PAGE_SHIFT;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_filemap_range_has_page(mapping, start_byte, end_byte);
 
 	if (end_byte < start_byte)
 		return false;
@@ -508,7 +513,69 @@ bool filemap_range_has_page(struct address_space *mapping,
 }
 EXPORT_SYMBOL(filemap_range_has_page);
 
+bool cc_filemap_range_has_page(struct address_space *mapping,
+			   loff_t start_byte, loff_t end_byte)
+{
+	struct folio *folio;
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), start_byte >> PAGE_SHIFT);
+	pgoff_t max = end_byte >> PAGE_SHIFT;
+
+	if (end_byte < start_byte)
+		return false;
+
+	rcu_read_lock();
+	for (;;) {
+		folio = cc_xas_find(&xas, max);
+		if (cc_xas_retry(&xas, folio))
+			continue;
+		/* Shadow entries don't count */
+		if (cc_xa_is_value(folio))
+			continue;
+		/*
+		 * We don't need to try to pin this page; we're about to
+		 * release the RCU lock anyway.  It is enough to know that
+		 * there was a page here recently.
+		 */
+		break;
+	}
+	rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
+
+	return folio != NULL;
+}
+EXPORT_SYMBOL(cc_filemap_range_has_page);
+
 static void __filemap_fdatawait_range(struct address_space *mapping,
+				     loff_t start_byte, loff_t end_byte)
+{
+	pgoff_t index = start_byte >> PAGE_SHIFT;
+	pgoff_t end = end_byte >> PAGE_SHIFT;
+	struct folio_batch fbatch;
+	unsigned nr_folios;
+
+	folio_batch_init(&fbatch);
+
+	while (index <= end) {
+		unsigned i;
+
+		nr_folios = filemap_get_folios_tag(mapping, &index, end,
+				PAGECACHE_TAG_WRITEBACK, &fbatch);
+
+		if (!nr_folios)
+			break;
+
+		for (i = 0; i < nr_folios; i++) {
+			struct folio *folio = fbatch.folios[i];
+
+			folio_wait_writeback(folio);
+			folio_clear_error(folio);
+		}
+		folio_batch_release(&fbatch);
+		cond_resched();
+	}
+}
+
+static void __cc_filemap_fdatawait_range(struct address_space *mapping,
 				     loff_t start_byte, loff_t end_byte)
 {
 	pgoff_t index = start_byte >> PAGE_SHIFT;
@@ -562,6 +629,14 @@ int filemap_fdatawait_range(struct address_space *mapping, loff_t start_byte,
 }
 EXPORT_SYMBOL(filemap_fdatawait_range);
 
+int cc_filemap_fdatawait_range(struct address_space *mapping, loff_t start_byte,
+			    loff_t end_byte)
+{
+	__cc_filemap_fdatawait_range(mapping, start_byte, end_byte);
+	return filemap_check_errors(mapping);
+}
+EXPORT_SYMBOL(cc_filemap_fdatawait_range);
+
 /**
  * filemap_fdatawait_range_keep_errors - wait for writeback to complete
  * @mapping:		address space structure to wait for
@@ -609,6 +684,15 @@ int file_fdatawait_range(struct file *file, loff_t start_byte, loff_t end_byte)
 }
 EXPORT_SYMBOL(file_fdatawait_range);
 
+int cc_file_fdatawait_range(struct file *file, loff_t start_byte, loff_t end_byte)
+{
+	struct address_space *mapping = file->f_mapping;
+
+	__cc_filemap_fdatawait_range(mapping, start_byte, end_byte);
+	return file_check_and_advance_wb_err(file);
+}
+EXPORT_SYMBOL(cc_file_fdatawait_range);
+
 /**
  * filemap_fdatawait_keep_errors - wait for writeback without clearing errors
  * @mapping: address space structure to wait for
@@ -629,6 +713,14 @@ int filemap_fdatawait_keep_errors(struct address_space *mapping)
 	return filemap_check_and_keep_errors(mapping);
 }
 EXPORT_SYMBOL(filemap_fdatawait_keep_errors);
+
+int cc_filemap_fdatawait_keep_errors(struct address_space *mapping)
+{
+	__cc_filemap_fdatawait_range(mapping, 0, LLONG_MAX);
+	return filemap_check_and_keep_errors(mapping);
+}
+EXPORT_SYMBOL(cc_filemap_fdatawait_keep_errors);
+
 
 /* Returns true if writeback might be needed or already in progress. */
 static bool mapping_needs_writeback(struct address_space *mapping)
@@ -705,6 +797,34 @@ int filemap_write_and_wait_range(struct address_space *mapping,
 	return err;
 }
 EXPORT_SYMBOL(filemap_write_and_wait_range);
+
+int cc_filemap_write_and_wait_range(struct address_space *mapping,
+				 loff_t lstart, loff_t lend)
+{
+	int err = 0, err2;
+
+	if (lend < lstart)
+		return 0;
+
+	if (mapping_needs_writeback(mapping)) {
+		err = __filemap_fdatawrite_range(mapping, lstart, lend,
+						 WB_SYNC_ALL);
+		/*
+		 * Even if the above returned error, the pages may be
+		 * written partially (e.g. -ENOSPC), so we wait for it.
+		 * But the -EIO is special case, it may indicate the worst
+		 * thing (e.g. bug) happened, so we avoid waiting for it.
+		 */
+		if (err != -EIO)
+			__cc_filemap_fdatawait_range(mapping, lstart, lend);
+	}
+	err2 = filemap_check_errors(mapping);
+	if (!err)
+		err = err2;
+	return err;
+}
+EXPORT_SYMBOL(cc_filemap_write_and_wait_range);
+
 
 void __filemap_set_wb_err(struct address_space *mapping, int err)
 {
