@@ -4339,6 +4339,8 @@ static bool filemap_map_pmd(struct vm_fault *vmf, struct folio *folio,
 	return false;
 }
 
+static struct folio *cc_next_uptodate_folio(struct cc_xa_state *xas,
+		struct address_space *mapping, pgoff_t end_pgoff);
 static struct folio *next_uptodate_folio(struct xa_state *xas,
 		struct address_space *mapping, pgoff_t end_pgoff)
 {
@@ -4376,6 +4378,47 @@ unlock:
 skip:
 		folio_put(folio);
 	} while ((folio = xas_next_entry(xas, end_pgoff)) != NULL);
+
+	return NULL;
+}
+
+static struct folio *cc_next_uptodate_folio(struct cc_xa_state *xas,
+		struct address_space *mapping, pgoff_t end_pgoff)
+{
+	struct folio *folio = cc_xas_next_entry(xas, end_pgoff);
+	unsigned long max_idx;
+
+	do {
+		if (!folio)
+			return NULL;
+		if (cc_xas_retry(xas, folio))
+			continue;
+		if (cc_xa_is_value(folio))
+			continue;
+		if (folio_test_locked(folio))
+			continue;
+		if (!folio_try_get_rcu(folio))
+			continue;
+		/* Has the page moved or been split? */
+		if (unlikely(folio != cc_xas_reload(xas)))
+			goto skip;
+		if (!folio_test_uptodate(folio) || folio_test_readahead(folio))
+			goto skip;
+		if (!folio_trylock(folio))
+			goto skip;
+		if (folio->mapping != mapping)
+			goto unlock;
+		if (!folio_test_uptodate(folio))
+			goto unlock;
+		max_idx = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE);
+		if (xas->xa_index >= max_idx)
+			goto unlock;
+		return folio;
+unlock:
+		folio_unlock(folio);
+skip:
+		folio_put(folio);
+	} while ((folio = cc_xas_next_entry(xas, end_pgoff)) != NULL);
 
 	return NULL;
 }
@@ -4466,6 +4509,8 @@ static vm_fault_t filemap_map_order0_folio(struct vm_fault *vmf,
 	return ret;
 }
 
+vm_fault_t cc_filemap_map_pages(struct vm_fault *vmf,
+			     pgoff_t start_pgoff, pgoff_t end_pgoff);
 vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 			     pgoff_t start_pgoff, pgoff_t end_pgoff)
 {
@@ -4478,6 +4523,9 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 	struct folio *folio;
 	vm_fault_t ret = 0;
 	unsigned int nr_pages = 0, mmap_miss = 0, mmap_miss_saved;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_filemap_map_pages(vmf, start_pgoff, end_pgoff);
 
 	rcu_read_lock();
 	folio = next_uptodate_folio(&xas, mapping, end_pgoff);
@@ -4529,6 +4577,71 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL(filemap_map_pages);
+
+vm_fault_t cc_filemap_map_pages(struct vm_fault *vmf,
+			     pgoff_t start_pgoff, pgoff_t end_pgoff)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct file *file = vma->vm_file;
+	struct address_space *mapping = file->f_mapping;
+	pgoff_t last_pgoff = start_pgoff;
+	unsigned long addr;
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), start_pgoff);
+	struct folio *folio;
+	vm_fault_t ret = 0;
+	unsigned int nr_pages = 0, mmap_miss = 0, mmap_miss_saved;
+
+	//rcu_read_lock();
+	folio = cc_next_uptodate_folio(&xas, mapping, end_pgoff);
+	if (!folio)
+		goto out;
+
+	if (filemap_map_pmd(vmf, folio, start_pgoff)) {
+		ret = VM_FAULT_NOPAGE;
+		goto out;
+	}
+
+	addr = vma->vm_start + ((start_pgoff - vma->vm_pgoff) << PAGE_SHIFT);
+	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, addr, &vmf->ptl);
+	if (!vmf->pte) {
+		folio_unlock(folio);
+		folio_put(folio);
+		goto out;
+	}
+	do {
+		unsigned long end;
+
+		addr += (xas.xa_index - last_pgoff) << PAGE_SHIFT;
+		vmf->pte += xas.xa_index - last_pgoff;
+		last_pgoff = xas.xa_index;
+		end = folio->index + folio_nr_pages(folio) - 1;
+		nr_pages = min(end, end_pgoff) - xas.xa_index + 1;
+
+		if (!folio_test_large(folio))
+			ret |= filemap_map_order0_folio(vmf,
+					folio, addr, &mmap_miss);
+		else
+			ret |= filemap_map_folio_range(vmf, folio,
+					xas.xa_index - folio->index, addr,
+					nr_pages, &mmap_miss);
+
+		folio_unlock(folio);
+		folio_put(folio);
+	} while ((folio = cc_next_uptodate_folio(&xas, mapping, end_pgoff)) != NULL);
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+out:
+	//rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
+
+	mmap_miss_saved = READ_ONCE(file->f_ra.mmap_miss);
+	if (mmap_miss >= mmap_miss_saved)
+		WRITE_ONCE(file->f_ra.mmap_miss, 0);
+	else
+		WRITE_ONCE(file->f_ra.mmap_miss, mmap_miss_saved - mmap_miss);
+
+	return ret;
+}
+EXPORT_SYMBOL(cc_filemap_map_pages);
 
 vm_fault_t filemap_page_mkwrite(struct vm_fault *vmf)
 {
