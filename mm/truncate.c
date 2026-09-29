@@ -28,6 +28,9 @@
  * itself locked.  These unlocked entries need verification under the tree
  * lock.
  */
+static inline void __cc_clear_shadow_entry(struct address_space *mapping,
+				pgoff_t index, void *entry);
+
 static inline void __clear_shadow_entry(struct address_space *mapping,
 				pgoff_t index, void *entry)
 {
@@ -37,6 +40,23 @@ static inline void __clear_shadow_entry(struct address_space *mapping,
 	if (xas_load(&xas) != entry)
 		return;
 	xas_store(&xas, NULL);
+}
+
+static inline void __cc_clear_shadow_entry(struct address_space *mapping,
+				pgoff_t index, void *entry)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+
+	cc_xas_set_update(&xas, cc_workingset_update_node);
+	if (cc_xas_load(&xas, false) != entry) {
+		cc_xas_rewind_refcnt(&xas);
+		cc_xas_clear_xa_node(&xas);
+		return;
+	}
+
+	cc_xas_store(&xas, NULL);
+	cc_xas_rewind_refcnt(&xas);
+	cc_xas_clear_xa_node(&xas);
 }
 
 static void clear_shadow_entry(struct address_space *mapping, pgoff_t index,
@@ -467,6 +487,8 @@ void truncate_inode_pages_final(struct address_space *mapping)
 	 * so that it does not install eviction information after the
 	 * final truncate has begun.
 	 */
+	unsigned long flags;
+
 	mapping_set_exiting(mapping);
 
 	if (!mapping_empty(mapping)) {
@@ -477,6 +499,8 @@ void truncate_inode_pages_final(struct address_space *mapping)
 		 * completed before starting the final truncate.
 		 */
 		xa_lock_irq(&mapping->i_pages);
+		spin_lock_irqsave(&mapping->nr_lock, flags);
+		spin_unlock_irqrestore(&mapping->nr_lock, flags);
 		xa_unlock_irq(&mapping->i_pages);
 	}
 

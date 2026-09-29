@@ -28,9 +28,11 @@ static const char *bdi_unknown_name = "(unknown)";
  * reader side locking.
  */
 DEFINE_SPINLOCK(bdi_lock);
+EXPORT_SYMBOL(bdi_lock);
 static u64 bdi_id_cursor;
 static struct rb_root bdi_tree = RB_ROOT;
 LIST_HEAD(bdi_list);
+EXPORT_SYMBOL(bdi_list);
 
 /* bdi_wq serves all asynchronous writeback tasks */
 struct workqueue_struct *bdi_wq;
@@ -396,6 +398,7 @@ void wb_wakeup_delayed(struct bdi_writeback *wb)
 		queue_delayed_work(bdi_wq, &wb->dwork, timeout);
 	spin_unlock_irq(&wb->work_lock);
 }
+EXPORT_SYMBOL(wb_wakeup_delayed);
 
 static void wb_update_bandwidth_workfn(struct work_struct *work)
 {
@@ -419,6 +422,7 @@ static int wb_init(struct bdi_writeback *wb, struct backing_dev_info *bdi,
 
 	wb->bdi = bdi;
 	wb->last_old_flush = jiffies;
+	wb->nr_threads = 0;
 	INIT_LIST_HEAD(&wb->b_dirty);
 	INIT_LIST_HEAD(&wb->b_io);
 	INIT_LIST_HEAD(&wb->b_more_io);
@@ -738,6 +742,7 @@ struct bdi_writeback *wb_get_create(struct backing_dev_info *bdi,
 
 	return wb;
 }
+EXPORT_SYMBOL(wb_get_create);
 
 static int cgwb_bdi_init(struct backing_dev_info *bdi)
 {
@@ -848,6 +853,7 @@ void wb_memcg_offline(struct mem_cgroup *memcg)
 
 	queue_work(system_unbound_wq, &cleanup_offline_cgwbs_work);
 }
+EXPORT_SYMBOL(wb_memcg_offline);
 
 /**
  * wb_blkcg_offline - kill all wb's associated with a blkcg being offlined

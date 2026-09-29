@@ -3159,6 +3159,7 @@ void __memcg_kmem_uncharge_page(struct page *page, int order)
 	folio->memcg_data = 0;
 	obj_cgroup_put(objcg);
 }
+EXPORT_SYMBOL_GPL(__memcg_kmem_uncharge_page);
 
 void mod_objcg_state(struct obj_cgroup *objcg, struct pglist_data *pgdat,
 		     enum node_stat_item idx, int nr)
@@ -3428,6 +3429,7 @@ void split_page_memcg(struct page *head, unsigned int nr)
 	else
 		css_get_many(&memcg->css, nr - 1);
 }
+EXPORT_SYMBOL_GPL(split_page_memcg);
 
 #ifdef CONFIG_SWAP
 /**
@@ -4577,6 +4579,7 @@ struct wb_domain *mem_cgroup_wb_domain(struct bdi_writeback *wb)
 
 	return &memcg->cgwb_domain;
 }
+EXPORT_SYMBOL_GPL(mem_cgroup_wb_domain);
 
 /**
  * mem_cgroup_wb_stats - retrieve writeback related stats from its memcg
@@ -4620,6 +4623,7 @@ void mem_cgroup_wb_stats(struct bdi_writeback *wb, unsigned long *pfilepages,
 		memcg = parent;
 	}
 }
+EXPORT_SYMBOL_GPL(mem_cgroup_wb_stats);
 
 /*
  * Foreign dirty flushing
@@ -4744,6 +4748,7 @@ void mem_cgroup_flush_foreign(struct bdi_writeback *wb)
 		}
 	}
 }
+EXPORT_SYMBOL_GPL(mem_cgroup_flush_foreign);
 
 #else	/* CONFIG_CGROUP_WRITEBACK */
 

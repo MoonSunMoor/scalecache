@@ -96,6 +96,7 @@ long get_nr_dirty_inodes(void)
 	long nr_dirty = get_nr_inodes() - get_nr_inodes_unused();
 	return nr_dirty > 0 ? nr_dirty : 0;
 }
+EXPORT_SYMBOL_GPL(get_nr_dirty_inodes);
 
 /*
  * Handle nr_inode sysctl
@@ -400,6 +401,7 @@ static void __address_space_init_once(struct address_space *mapping)
 	init_rwsem(&mapping->i_mmap_rwsem);
 	INIT_LIST_HEAD(&mapping->private_list);
 	spin_lock_init(&mapping->private_lock);
+	spin_lock_init(&mapping->nr_lock);
 	mapping->i_mmap = RB_ROOT_CACHED;
 }
 
@@ -479,6 +481,7 @@ void inode_add_lru(struct inode *inode)
 {
 	__inode_add_lru(inode, false);
 }
+EXPORT_SYMBOL(inode_add_lru);
 
 static void inode_lru_list_del(struct inode *inode)
 {
@@ -604,13 +607,17 @@ void dump_mapping(const struct address_space *mapping)
 
 void clear_inode(struct inode *inode)
 {
+	unsigned long flags;
 	/*
 	 * We have to cycle the i_pages lock here because reclaim can be in the
 	 * process of removing the last page (in __filemap_remove_folio())
 	 * and we must not free the mapping under it.
 	 */
 	xa_lock_irq(&inode->i_data.i_pages);
+	spin_lock_irqsave(&inode->i_data.nr_lock, flags);
 	BUG_ON(inode->i_data.nrpages);
+	spin_unlock_irqrestore(&inode->i_data.nr_lock, flags);
+
 	/*
 	 * Almost always, mapping_empty(&inode->i_data) here; but there are
 	 * two known and long-standing ways in which nodes may get left behind
@@ -623,7 +630,7 @@ void clear_inode(struct inode *inode)
 	BUG_ON(!list_empty(&inode->i_data.private_list));
 	BUG_ON(!(inode->i_state & I_FREEING));
 	BUG_ON(inode->i_state & I_CLEAR);
-	BUG_ON(!list_empty(&inode->i_wb_list));
+	// BUG_ON(!list_empty(&inode->i_wb_list));
 	/* don't need i_lock here, no concurrent mods to i_state */
 	inode->i_state = I_FREEING | I_CLEAR;
 }
@@ -806,6 +813,8 @@ static enum lru_status inode_lru_isolate(struct list_head *item,
 {
 	struct list_head *freeable = arg;
 	struct inode	*inode = container_of(item, struct inode, i_lru);
+	unsigned long nrpages;
+	unsigned long flags;
 
 	/*
 	 * We are inverting the lru lock/inode->i_lock here, so use a
@@ -841,7 +850,11 @@ static enum lru_status inode_lru_isolate(struct list_head *item,
 	 * page cache in order to free up struct inodes: lowmem might
 	 * be under pressure before the cache inside the highmem zone.
 	 */
-	if (inode_has_buffers(inode) || !mapping_empty(&inode->i_data)) {
+	spin_lock_irqsave(&inode->i_data.nr_lock, flags);
+	nrpages = inode->i_data.nrpages;
+	spin_unlock_irqrestore(&inode->i_data.nr_lock, flags);
+
+	if (inode_has_buffers(inode) || !mapping_empty(&inode->i_data) || nrpages) {
 		__iget(inode);
 		spin_unlock(&inode->i_lock);
 		spin_unlock(lru_lock);

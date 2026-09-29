@@ -2346,6 +2346,7 @@ bool compaction_suitable(struct zone *zone, int order, int highest_zoneidx)
 
 	return suitable;
 }
+EXPORT_SYMBOL(compaction_suitable);
 
 bool compaction_zonelist_suitable(struct alloc_context *ac, int order,
 		int alloc_flags)

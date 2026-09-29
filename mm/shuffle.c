@@ -10,6 +10,7 @@
 #include "shuffle.h"
 
 DEFINE_STATIC_KEY_FALSE(page_alloc_shuffle_key);
+EXPORT_SYMBOL_GPL(page_alloc_shuffle_key);
 
 static bool shuffle_param;
 
@@ -180,3 +181,4 @@ bool shuffle_pick_tail(void)
 
 	return ret;
 }
+EXPORT_SYMBOL_GPL(shuffle_pick_tail);

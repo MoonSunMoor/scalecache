@@ -2359,10 +2359,17 @@ int generic_access_phys(struct vm_area_struct *vma, unsigned long addr,
 			void *buf, int len, int write);
 
 extern void truncate_pagecache(struct inode *inode, loff_t new);
+extern void cc_truncate_pagecache(struct inode *inode, loff_t new);
+
 extern void truncate_setsize(struct inode *inode, loff_t newsize);
 void pagecache_isize_extended(struct inode *inode, loff_t from, loff_t to);
+void cc_pagecache_isize_extended(struct inode *inode, loff_t from, loff_t to);
+
 void truncate_pagecache_range(struct inode *inode, loff_t offset, loff_t end);
+void cc_truncate_pagecache_range(struct inode *inode, loff_t offset, loff_t end);
+
 int generic_error_remove_page(struct address_space *mapping, struct page *page);
+int cc_generic_error_remove_page(struct address_space *mapping, struct page *page);
 
 struct vm_area_struct *lock_mm_and_find_vma(struct mm_struct *mm,
 		unsigned long address, struct pt_regs *regs);
@@ -3330,14 +3337,25 @@ extern unsigned long vm_unmapped_area(struct vm_unmapped_area_info *info);
 
 /* truncate.c */
 extern void truncate_inode_pages(struct address_space *, loff_t);
+extern void cc_truncate_inode_pages(struct address_space *, loff_t);
+
 extern void truncate_inode_pages_range(struct address_space *,
 				       loff_t lstart, loff_t lend);
+extern void cc_truncate_inode_pages_range(struct address_space *,
+				       loff_t lstart, loff_t lend);
+
+
 extern void truncate_inode_pages_final(struct address_space *);
+extern void cc_truncate_inode_pages_final(struct address_space *);
 
 /* generic vm_area_ops exported for stackable file systems */
 extern vm_fault_t filemap_fault(struct vm_fault *vmf);
+extern vm_fault_t cc_filemap_fault(struct vm_fault *vmf);
 extern vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 		pgoff_t start_pgoff, pgoff_t end_pgoff);
+extern vm_fault_t cc_filemap_map_pages(struct vm_fault *vmf,
+		pgoff_t start_pgoff, pgoff_t end_pgoff);
+
 extern vm_fault_t filemap_page_mkwrite(struct vm_fault *vmf);
 
 extern unsigned long stack_guard_gap;

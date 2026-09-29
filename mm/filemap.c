@@ -123,11 +123,19 @@
  *    ->private_lock		(zap_pte_range->block_dirty_folio)
  */
 
+static void cc_page_cache_delete(struct address_space *mapping,
+				   struct folio *folio, void *shadow);
+
 static void page_cache_delete(struct address_space *mapping,
 				   struct folio *folio, void *shadow)
 {
+	unsigned long flags;
+
 	XA_STATE(xas, &mapping->i_pages, folio->index);
 	long nr = 1;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_page_cache_delete(mapping, folio, shadow);
 
 	mapping_set_update(&xas, mapping);
 
@@ -144,7 +152,37 @@ static void page_cache_delete(struct address_space *mapping,
 
 	folio->mapping = NULL;
 	/* Leave page->index set: truncation lookup relies upon it */
+	spin_lock_irqsave(&mapping->nr_lock, flags);
 	mapping->nrpages -= nr;
+	spin_unlock_irqrestore(&mapping->nr_lock, flags);
+}
+
+static void cc_page_cache_delete(struct address_space *mapping,
+				   struct folio *folio, void *shadow)
+{
+	unsigned long flags;
+
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), folio->index);
+	long nr = 1;
+
+	cc_mapping_set_update(&xas, mapping);
+
+	/* hugetlb pages are represented by a single entry in the xarray */
+	if (!folio_test_hugetlb(folio)) {
+		cc_xas_set_order(&xas, folio->index, folio_order(folio));
+		nr = folio_nr_pages(folio);
+	}
+
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+
+	cc_xas_store(&xas, shadow);
+	cc_xas_init_marks(&xas);
+
+	folio->mapping = NULL;
+	/* Leave page->index set: truncation lookup relies upon it */
+	spin_lock_irqsave(&mapping->nr_lock, flags);
+	mapping->nrpages -= nr;
+	spin_unlock_irqrestore(&mapping->nr_lock, flags);
 }
 
 static void filemap_unaccount_folio(struct address_space *mapping,
@@ -276,6 +314,9 @@ void filemap_remove_folio(struct folio *folio)
  *
  * The function expects the i_pages lock to be held.
  */
+static void cc_page_cache_delete_batch(struct address_space *mapping,
+			     struct folio_batch *fbatch);
+
 static void page_cache_delete_batch(struct address_space *mapping,
 			     struct folio_batch *fbatch)
 {
@@ -283,11 +324,13 @@ static void page_cache_delete_batch(struct address_space *mapping,
 	long total_pages = 0;
 	int i = 0;
 	struct folio *folio;
+	unsigned long flags;
 
 	mapping_set_update(&xas, mapping);
 	xas_for_each(&xas, folio, ULONG_MAX) {
 		if (i >= folio_batch_count(fbatch))
 			break;
+
 
 		/* A swap/dax/shadow entry got inserted? Skip it. */
 		if (xa_is_value(folio))
@@ -314,7 +357,56 @@ static void page_cache_delete_batch(struct address_space *mapping,
 		xas_store(&xas, NULL);
 		total_pages += folio_nr_pages(folio);
 	}
+	spin_lock_irqsave(&mapping->nr_lock, flags);
 	mapping->nrpages -= total_pages;
+	spin_unlock_irqrestore(&mapping->nr_lock, flags);
+}
+
+static void cc_page_cache_delete_batch(struct address_space *mapping,
+			     struct folio_batch *fbatch)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), fbatch->folios[0]->index);
+	long total_pages = 0;
+	int i = 0;
+	struct folio *folio;
+	unsigned long flags;
+
+	cc_mapping_set_update(&xas, mapping);
+	cc_xas_for_each(&xas, folio, ULONG_MAX) {
+		if (i >= folio_batch_count(fbatch))
+			break;
+
+
+		/* A swap/dax/shadow entry got inserted? Skip it. */
+		if (xa_is_value(folio))
+			continue;
+		/*
+		 * A page got inserted in our range? Skip it. We have our
+		 * pages locked so they are protected from being removed.
+		 * If we see a page whose index is higher than ours, it
+		 * means our page has been removed, which shouldn't be
+		 * possible because we're holding the PageLock.
+		 */
+		if (folio != fbatch->folios[i]) {
+			VM_BUG_ON_FOLIO(folio->index >
+					fbatch->folios[i]->index, folio);
+			continue;
+		}
+
+		WARN_ON_ONCE(!folio_test_locked(folio));
+
+		folio->mapping = NULL;
+		/* Leave folio->index set: truncation lookup relies on it */
+
+		i++;
+		cc_xas_store(&xas, NULL);
+		total_pages += folio_nr_pages(folio);
+	}
+	cc_xas_clear_xa_node(&xas);
+
+	spin_lock_irqsave(&mapping->nr_lock, flags);
+	mapping->nrpages -= total_pages;
+	spin_unlock_irqrestore(&mapping->nr_lock, flags);
 }
 
 void delete_from_page_cache_batch(struct address_space *mapping,
@@ -469,12 +561,17 @@ EXPORT_SYMBOL(filemap_flush);
  * Return: %true if at least one page exists in the specified range,
  * %false otherwise.
  */
+bool cc_filemap_range_has_page(struct address_space *mapping,
+			   loff_t start_byte, loff_t end_byte);
 bool filemap_range_has_page(struct address_space *mapping,
 			   loff_t start_byte, loff_t end_byte)
 {
 	struct folio *folio;
 	XA_STATE(xas, &mapping->i_pages, start_byte >> PAGE_SHIFT);
 	pgoff_t max = end_byte >> PAGE_SHIFT;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_filemap_range_has_page(mapping, start_byte, end_byte);
 
 	if (end_byte < start_byte)
 		return false;
@@ -500,7 +597,69 @@ bool filemap_range_has_page(struct address_space *mapping,
 }
 EXPORT_SYMBOL(filemap_range_has_page);
 
+bool cc_filemap_range_has_page(struct address_space *mapping,
+			   loff_t start_byte, loff_t end_byte)
+{
+	struct folio *folio;
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), start_byte >> PAGE_SHIFT);
+	pgoff_t max = end_byte >> PAGE_SHIFT;
+
+	if (end_byte < start_byte)
+		return false;
+
+	rcu_read_lock();
+	for (;;) {
+		folio = cc_xas_find(&xas, max);
+		if (cc_xas_retry(&xas, folio))
+			continue;
+		/* Shadow entries don't count */
+		if (cc_xa_is_value(folio))
+			continue;
+		/*
+		 * We don't need to try to pin this page; we're about to
+		 * release the RCU lock anyway.  It is enough to know that
+		 * there was a page here recently.
+		 */
+		break;
+	}
+	rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
+
+	return folio != NULL;
+}
+EXPORT_SYMBOL(cc_filemap_range_has_page);
+
 static void __filemap_fdatawait_range(struct address_space *mapping,
+				     loff_t start_byte, loff_t end_byte)
+{
+	pgoff_t index = start_byte >> PAGE_SHIFT;
+	pgoff_t end = end_byte >> PAGE_SHIFT;
+	struct folio_batch fbatch;
+	unsigned nr_folios;
+
+	folio_batch_init(&fbatch);
+
+	while (index <= end) {
+		unsigned i;
+
+		nr_folios = filemap_get_folios_tag(mapping, &index, end,
+				PAGECACHE_TAG_WRITEBACK, &fbatch);
+
+		if (!nr_folios)
+			break;
+
+		for (i = 0; i < nr_folios; i++) {
+			struct folio *folio = fbatch.folios[i];
+
+			folio_wait_writeback(folio);
+			folio_clear_error(folio);
+		}
+		folio_batch_release(&fbatch);
+		cond_resched();
+	}
+}
+
+static void __cc_filemap_fdatawait_range(struct address_space *mapping,
 				     loff_t start_byte, loff_t end_byte)
 {
 	pgoff_t index = start_byte >> PAGE_SHIFT;
@@ -554,6 +713,14 @@ int filemap_fdatawait_range(struct address_space *mapping, loff_t start_byte,
 }
 EXPORT_SYMBOL(filemap_fdatawait_range);
 
+int cc_filemap_fdatawait_range(struct address_space *mapping, loff_t start_byte,
+			    loff_t end_byte)
+{
+	__cc_filemap_fdatawait_range(mapping, start_byte, end_byte);
+	return filemap_check_errors(mapping);
+}
+EXPORT_SYMBOL(cc_filemap_fdatawait_range);
+
 /**
  * filemap_fdatawait_range_keep_errors - wait for writeback to complete
  * @mapping:		address space structure to wait for
@@ -601,6 +768,15 @@ int file_fdatawait_range(struct file *file, loff_t start_byte, loff_t end_byte)
 }
 EXPORT_SYMBOL(file_fdatawait_range);
 
+int cc_file_fdatawait_range(struct file *file, loff_t start_byte, loff_t end_byte)
+{
+	struct address_space *mapping = file->f_mapping;
+
+	__cc_filemap_fdatawait_range(mapping, start_byte, end_byte);
+	return file_check_and_advance_wb_err(file);
+}
+EXPORT_SYMBOL(cc_file_fdatawait_range);
+
 /**
  * filemap_fdatawait_keep_errors - wait for writeback without clearing errors
  * @mapping: address space structure to wait for
@@ -622,10 +798,23 @@ int filemap_fdatawait_keep_errors(struct address_space *mapping)
 }
 EXPORT_SYMBOL(filemap_fdatawait_keep_errors);
 
+int cc_filemap_fdatawait_keep_errors(struct address_space *mapping)
+{
+	__cc_filemap_fdatawait_range(mapping, 0, LLONG_MAX);
+	return filemap_check_and_keep_errors(mapping);
+}
+EXPORT_SYMBOL(cc_filemap_fdatawait_keep_errors);
+
+
 /* Returns true if writeback might be needed or already in progress. */
 static bool mapping_needs_writeback(struct address_space *mapping)
 {
-	return mapping->nrpages;
+	unsigned long flags, nrpages;
+
+	spin_lock_irqsave(&mapping->nr_lock, flags);
+	nrpages = mapping->nrpages;
+	spin_unlock_irqrestore(&mapping->nr_lock, flags);
+	return nrpages;
 }
 
 bool filemap_range_has_writeback(struct address_space *mapping,
@@ -692,6 +881,34 @@ int filemap_write_and_wait_range(struct address_space *mapping,
 	return err;
 }
 EXPORT_SYMBOL(filemap_write_and_wait_range);
+
+int cc_filemap_write_and_wait_range(struct address_space *mapping,
+				 loff_t lstart, loff_t lend)
+{
+	int err = 0, err2;
+
+	if (lend < lstart)
+		return 0;
+
+	if (mapping_needs_writeback(mapping)) {
+		err = __filemap_fdatawrite_range(mapping, lstart, lend,
+						 WB_SYNC_ALL);
+		/*
+		 * Even if the above returned error, the pages may be
+		 * written partially (e.g. -ENOSPC), so we wait for it.
+		 * But the -EIO is special case, it may indicate the worst
+		 * thing (e.g. bug) happened, so we avoid waiting for it.
+		 */
+		if (err != -EIO)
+			__cc_filemap_fdatawait_range(mapping, lstart, lend);
+	}
+	err2 = filemap_check_errors(mapping);
+	if (!err)
+		err = err2;
+	return err;
+}
+EXPORT_SYMBOL(cc_filemap_write_and_wait_range);
+
 
 void __filemap_set_wb_err(struct address_space *mapping, int err)
 {
@@ -804,12 +1021,16 @@ EXPORT_SYMBOL(file_write_and_wait_range);
  *
  * The remove + add is atomic.  This function cannot fail.
  */
+void cc_replace_page_cache_folio(struct folio *old, struct folio *new);
 void replace_page_cache_folio(struct folio *old, struct folio *new)
 {
 	struct address_space *mapping = old->mapping;
 	void (*free_folio)(struct folio *) = mapping->a_ops->free_folio;
 	pgoff_t offset = old->index;
 	XA_STATE(xas, &mapping->i_pages, offset);
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_replace_page_cache_folio(old, new);
 
 	VM_BUG_ON_FOLIO(!folio_test_locked(old), old);
 	VM_BUG_ON_FOLIO(!folio_test_locked(new), new);
@@ -841,6 +1062,53 @@ void replace_page_cache_folio(struct folio *old, struct folio *new)
 }
 EXPORT_SYMBOL_GPL(replace_page_cache_folio);
 
+void cc_replace_page_cache_folio(struct folio *old, struct folio *new)
+{
+	struct address_space *mapping = old->mapping;
+	void (*free_folio)(struct folio *) = mapping->a_ops->free_folio;
+	pgoff_t offset = old->index;
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), offset);
+	unsigned long flags;
+
+	VM_BUG_ON_FOLIO(!folio_test_locked(old), old);
+	VM_BUG_ON_FOLIO(!folio_test_locked(new), new);
+	VM_BUG_ON_FOLIO(new->mapping, new);
+
+	folio_get(new);
+	new->mapping = mapping;
+	new->index = offset;
+
+	mem_cgroup_migrate(old, new);
+
+	// xas_lock_irq(&xas);
+
+	preempt_disable();
+	local_irq_save(flags);
+	cc_xas_store(&xas, new);
+
+	old->mapping = NULL;
+
+	/* hugetlb pages do not participate in page cache accounting. */
+	if (!folio_test_hugetlb(old))
+		__lruvec_stat_sub_folio(old, NR_FILE_PAGES);
+	if (!folio_test_hugetlb(new))
+		__lruvec_stat_add_folio(new, NR_FILE_PAGES);
+	if (folio_test_swapbacked(old))
+		__lruvec_stat_sub_folio(old, NR_SHMEM);
+	if (folio_test_swapbacked(new))
+		__lruvec_stat_add_folio(new, NR_SHMEM);
+	//xas_unlock_irq(&xas);
+	preempt_enable();
+	local_irq_restore(flags);
+
+	if (free_folio)
+		free_folio(old);
+	folio_put(old);
+}
+EXPORT_SYMBOL_GPL(cc_replace_page_cache_folio);
+
+noinline int __cc_filemap_add_folio(struct address_space *mapping,
+		struct folio *folio, pgoff_t index, gfp_t gfp, void **shadowp);
 noinline int __filemap_add_folio(struct address_space *mapping,
 		struct folio *folio, pgoff_t index, gfp_t gfp, void **shadowp)
 {
@@ -848,6 +1116,10 @@ noinline int __filemap_add_folio(struct address_space *mapping,
 	int huge = folio_test_hugetlb(folio);
 	bool charged = false;
 	long nr = 1;
+	unsigned long flags;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return __cc_filemap_add_folio(mapping, folio, index, gfp, shadowp);
 
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
 	VM_BUG_ON_FOLIO(folio_test_swapbacked(folio), folio);
@@ -901,7 +1173,9 @@ noinline int __filemap_add_folio(struct address_space *mapping,
 		if (xas_error(&xas))
 			goto unlock;
 
+		spin_lock_irqsave(&mapping->nr_lock, flags);
 		mapping->nrpages += nr;
+		spin_unlock_irqrestore(&mapping->nr_lock, flags);
 
 		/* hugetlb pages do not participate in page cache accounting */
 		if (!huge) {
@@ -928,6 +1202,129 @@ error:
 	return xas_error(&xas);
 }
 ALLOW_ERROR_INJECTION(__filemap_add_folio, ERRNO);
+
+noinline int __cc_filemap_add_folio(struct address_space *mapping,
+		struct folio *folio, pgoff_t index, gfp_t gfp, void **shadowp)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+	int huge = folio_test_hugetlb(folio);
+	bool charged = false;
+	long nr = 1;
+	unsigned long flags;
+
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+	VM_BUG_ON_FOLIO(folio_test_swapbacked(folio), folio);
+	cc_mapping_set_update(&xas, mapping);
+
+	if (!huge) {
+		int error = mem_cgroup_charge(folio, NULL, gfp);
+		VM_BUG_ON_FOLIO(index & (folio_nr_pages(folio) - 1), folio);
+		if (error) return error;
+		charged = true;
+		cc_xas_set_order(&xas, index, folio_order(folio));
+		nr = folio_nr_pages(folio);
+	}
+
+	gfp &= GFP_RECLAIM_MASK;
+	folio_ref_add(folio, nr);
+	folio->mapping = mapping;
+	folio->index = xas.xa_index;
+
+	do {
+		unsigned int order = cc_xa_get_order(xas.xa, xas.xa_index);
+		void *entry, *old = NULL;
+
+		if (order > folio_order(folio))
+			cc_xas_split_alloc(&xas, cc_xa_load(xas.xa, xas.xa_index),
+					order, gfp);
+		//xas_lock_irq(&xas);
+		local_irq_disable();
+		preempt_disable();
+
+		cc_xas_for_each_conflict(&xas, entry) {
+			old = entry;
+			if (!cc_xa_is_value(entry)) {
+				cc_xas_set_err(&xas, -EEXIST);
+				goto unlock;
+			}
+		}
+
+		if (old) {
+			if (shadowp)
+				*shadowp = old;
+			/* entry may have been split before we acquired lock */
+			order = cc_xa_get_order(xas.xa, xas.xa_index);
+			if (order > folio_order(folio)) {
+				/* How to handle large swap entries? */
+				BUG_ON(shmem_mapping(mapping));
+				cc_xas_split(&xas, old, order);
+				cc_xas_reset(&xas);
+			}
+		}
+
+		cc_xas_store(&xas, folio);
+		if (cc_xas_error(&xas))
+			goto unlock;
+
+		spin_lock_irqsave(&mapping->nr_lock, flags);
+		mapping->nrpages += nr;
+		spin_unlock_irqrestore(&mapping->nr_lock, flags);
+
+		/* hugetlb pages do not participate in page cache accounting */
+		if (!huge) {
+			__lruvec_stat_mod_folio(folio, NR_FILE_PAGES, nr);
+			if (folio_test_pmd_mappable(folio))
+				__lruvec_stat_mod_folio(folio,
+						NR_FILE_THPS, nr);
+		}
+unlock:
+		//xas_unlock_irq(&xas);
+		local_irq_enable();
+		preempt_enable();
+	} while (cc_xas_nomem(&xas, gfp));
+
+	if (cc_xas_error(&xas))
+		goto error;
+
+	trace_mm_filemap_add_to_page_cache(folio);
+	return 0;
+error:
+	if (charged)
+		mem_cgroup_uncharge(folio);
+	folio->mapping = NULL;
+	/* Leave page->index set: truncation relies upon it */
+	folio_put_refs(folio, nr);
+	return cc_xas_error(&xas);
+}
+ALLOW_ERROR_INJECTION(__cc_filemap_add_folio, ERRNO);
+
+int cc_filemap_add_folio(struct address_space *mapping, struct folio *folio,
+				pgoff_t index, gfp_t gfp)
+{
+	void *shadow = NULL;
+	int ret;
+
+	__folio_set_locked(folio);
+	ret = __cc_filemap_add_folio(mapping, folio, index, gfp, &shadow);
+	if (unlikely(ret))
+		__folio_clear_locked(folio);
+	else {
+		/*
+		 * The folio might have been evicted from cache only
+		 * recently, in which case it should be activated like
+		 * any other repeatedly accessed folio.
+		 * The exception is folios getting rewritten; evicting other
+		 * data from the working set, only to cache data that will
+		 * get overwritten with something else, is a waste of memory.
+		 */
+		WARN_ON_ONCE(folio_test_active(folio));
+		if (!(gfp & __GFP_WRITE) && shadow)
+			workingset_refault(folio, shadow);
+		folio_add_lru(folio);
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cc_filemap_add_folio);
 
 int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 				pgoff_t index, gfp_t gfp)
@@ -1728,10 +2125,16 @@ vm_fault_t __folio_lock_or_retry(struct folio *folio, struct vm_fault *vmf)
  * range specified (in which case 'return - index >= max_scan' will be true).
  * In the rare case of index wrap-around, 0 will be returned.
  */
+pgoff_t cc_page_cache_next_miss(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan);
+
 pgoff_t page_cache_next_miss(struct address_space *mapping,
 			     pgoff_t index, unsigned long max_scan)
 {
 	XA_STATE(xas, &mapping->i_pages, index);
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_page_cache_next_miss(mapping, index, max_scan);
 
 	while (max_scan--) {
 		void *entry = xas_next(&xas);
@@ -1744,6 +2147,25 @@ pgoff_t page_cache_next_miss(struct address_space *mapping,
 	return xas.xa_index;
 }
 EXPORT_SYMBOL(page_cache_next_miss);
+
+pgoff_t cc_page_cache_next_miss(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+
+	while (max_scan--) {
+		void *entry = cc_xas_next(&xas);
+		if (!entry || cc_xa_is_value(entry))
+			break;
+		if (xas.xa_index == 0)
+			break;
+	}
+
+	cc_xas_clear_xa_node(&xas);
+
+	return xas.xa_index;
+}
+EXPORT_SYMBOL(cc_page_cache_next_miss);
 
 /**
  * page_cache_prev_miss() - Find the previous gap in the page cache.
@@ -1764,10 +2186,15 @@ EXPORT_SYMBOL(page_cache_next_miss);
  * range specified (in which case 'index - return >= max_scan' will be true).
  * In the rare case of wrap-around, ULONG_MAX will be returned.
  */
+pgoff_t cc_page_cache_prev_miss(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan);
 pgoff_t page_cache_prev_miss(struct address_space *mapping,
 			     pgoff_t index, unsigned long max_scan)
 {
 	XA_STATE(xas, &mapping->i_pages, index);
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_page_cache_prev_miss(mapping, index, max_scan);
 
 	while (max_scan--) {
 		void *entry = xas_prev(&xas);
@@ -1780,6 +2207,25 @@ pgoff_t page_cache_prev_miss(struct address_space *mapping,
 	return xas.xa_index;
 }
 EXPORT_SYMBOL(page_cache_prev_miss);
+
+pgoff_t cc_page_cache_prev_miss(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+
+	while (max_scan--) {
+		void *entry = cc_xas_prev(&xas);
+		if (!entry || cc_xa_is_value(entry))
+			break;
+		if (xas.xa_index == ULONG_MAX)
+			break;
+	}
+
+	cc_xas_clear_xa_node(&xas);
+
+	return xas.xa_index;
+}
+EXPORT_SYMBOL(cc_page_cache_prev_miss);
 
 /*
  * Lockless page cache protocol:
@@ -1813,10 +2259,15 @@ EXPORT_SYMBOL(page_cache_prev_miss);
  *
  * Return: The folio, swap or shadow entry, %NULL if nothing is found.
  */
+
+void *cc_filemap_get_entry(struct address_space *mapping, pgoff_t index);
 void *filemap_get_entry(struct address_space *mapping, pgoff_t index)
 {
 	XA_STATE(xas, &mapping->i_pages, index);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_filemap_get_entry(mapping, index);
 
 	rcu_read_lock();
 repeat:
@@ -1844,6 +2295,38 @@ out:
 	return folio;
 }
 
+void *cc_filemap_get_entry(struct address_space *mapping, pgoff_t index)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+	struct folio *folio;
+
+	// rcu_read_lock();
+repeat:
+	cc_xas_reset(&xas);
+	folio = cc_xas_load(&xas, true);
+	if (cc_xas_retry(&xas, folio))
+		goto repeat;
+	/*
+	 * A shadow entry of a recently evicted page, or a swap entry from
+	 * shmem/tmpfs.  Return it without attempting to raise page count.
+	 */
+	if (!folio || cc_xa_is_value(folio))
+		goto out;
+
+	if (!folio_try_get_rcu(folio))
+		goto repeat;
+
+	if (unlikely(folio != cc_xas_reload(&xas))) {
+		folio_put(folio);
+		goto repeat;
+	}
+out:
+	//rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
+
+	return folio;
+}
+
 /**
  * __filemap_get_folio - Find and get a reference to a folio.
  * @mapping: The address_space to search.
@@ -1864,6 +2347,7 @@ struct folio *__filemap_get_folio(struct address_space *mapping, pgoff_t index,
 		fgf_t fgp_flags, gfp_t gfp)
 {
 	struct folio *folio;
+	unsigned long flags;
 
 repeat:
 	folio = filemap_get_entry(mapping, index);
@@ -1966,10 +2450,121 @@ no_page:
 }
 EXPORT_SYMBOL(__filemap_get_folio);
 
+struct folio *__cc_filemap_get_folio(struct address_space *mapping, pgoff_t index,
+		fgf_t fgp_flags, gfp_t gfp)
+{
+	struct folio *folio;
+	unsigned long flags;
+
+repeat:
+	folio = cc_filemap_get_entry(mapping, index);
+	if (cc_xa_is_value(folio))
+		folio = NULL;
+	if (!folio)
+		goto no_page;
+
+	if (fgp_flags & FGP_LOCK) {
+		if (fgp_flags & FGP_NOWAIT) {
+			if (!folio_trylock(folio)) {
+				folio_put(folio);
+				return ERR_PTR(-EAGAIN);
+			}
+		} else {
+			folio_lock(folio);
+		}
+
+		/* Has the page been truncated? */
+		if (unlikely(folio->mapping != mapping)) {
+			folio_unlock(folio);
+			folio_put(folio);
+			goto repeat;
+		}
+		VM_BUG_ON_FOLIO(!folio_contains(folio, index), folio);
+	}
+
+	if (fgp_flags & FGP_ACCESSED)
+		folio_mark_accessed(folio);
+	else if (fgp_flags & FGP_WRITE) {
+		/* Clear idle flag for buffer write */
+		if (folio_test_idle(folio))
+			folio_clear_idle(folio);
+	}
+
+	if (fgp_flags & FGP_STABLE)
+		folio_wait_stable(folio);
+no_page:
+	if (!folio && (fgp_flags & FGP_CREAT)) {
+		unsigned order = FGF_GET_ORDER(fgp_flags);
+		int err;
+
+		if ((fgp_flags & FGP_WRITE) && mapping_can_writeback(mapping))
+			gfp |= __GFP_WRITE;
+		if (fgp_flags & FGP_NOFS)
+			gfp &= ~__GFP_FS;
+		if (fgp_flags & FGP_NOWAIT) {
+			gfp &= ~GFP_KERNEL;
+			gfp |= GFP_NOWAIT | __GFP_NOWARN;
+		}
+		if (WARN_ON_ONCE(!(fgp_flags & (FGP_LOCK | FGP_FOR_MMAP))))
+			fgp_flags |= FGP_LOCK;
+
+		if (!mapping_large_folio_support(mapping))
+			order = 0;
+		if (order > MAX_PAGECACHE_ORDER)
+			order = MAX_PAGECACHE_ORDER;
+		/* If we're not aligned, allocate a smaller folio */
+		if (index & ((1UL << order) - 1))
+			order = __ffs(index);
+
+		do {
+			gfp_t alloc_gfp = gfp;
+
+			err = -ENOMEM;
+			if (order == 1)
+				order = 0;
+			if (order > 0)
+				alloc_gfp |= __GFP_NORETRY | __GFP_NOWARN;
+			folio = filemap_alloc_folio(alloc_gfp, order);
+			if (!folio)
+				continue;
+
+			/* Init accessed so avoid atomic mark_page_accessed later */
+			if (fgp_flags & FGP_ACCESSED)
+				__folio_set_referenced(folio);
+
+			err = filemap_add_folio(mapping, folio, index, gfp);
+			if (!err)
+				break;
+			folio_put(folio);
+			folio = NULL;
+		} while (order-- > 0);
+
+		if (err == -EEXIST)
+			goto repeat;
+		if (err)
+			return ERR_PTR(err);
+		/*
+		 * filemap_add_folio locks the page, and for mmap
+		 * we expect an unlocked page.
+		 */
+		if (folio && (fgp_flags & FGP_FOR_MMAP))
+			folio_unlock(folio);
+	}
+
+	if (!folio)
+		return ERR_PTR(-ENOENT);
+	return folio;
+}
+EXPORT_SYMBOL(__cc_filemap_get_folio);
+
+static inline struct folio *cc_find_get_entry(struct cc_xa_state *xas, pgoff_t max,
+		xa_mark_t mark);
 static inline struct folio *find_get_entry(struct xa_state *xas, pgoff_t max,
 		xa_mark_t mark)
 {
 	struct folio *folio;
+	if (cc_xas_is_ccxarray(xas))
+		printk(KERN_ERR "[%s] need to check! (%pS)\n", __func__, __builtin_return_address(0));
 
 retry:
 	if (mark == XA_PRESENT)
@@ -2000,6 +2595,40 @@ reset:
 	xas_reset(xas);
 	goto retry;
 }
+static inline struct folio *cc_find_get_entry(struct cc_xa_state *xas, pgoff_t max,
+		xa_mark_t mark)
+{
+	struct folio *folio;
+
+retry:
+	if (mark == XA_PRESENT)
+		folio = cc_xas_find(xas, max);
+	else
+		folio = cc_xas_find_marked(xas, max, mark);
+
+	if (cc_xas_retry(xas, folio))
+		goto retry;
+	/*
+	 * A shadow entry of a recently evicted page, a swap
+	 * entry from shmem/tmpfs or a DAX entry.  Return it
+	 * without attempting to raise page count.
+	 */
+	if (!folio || cc_xa_is_value(folio))
+		return folio;
+
+	if (!folio_try_get_rcu(folio))
+		goto reset;
+
+	if (unlikely(folio != cc_xas_reload(xas))) {
+		folio_put(folio);
+		goto reset;
+	}
+
+	return folio;
+reset:
+	cc_xas_reset(xas);
+	goto retry;
+}
 
 /**
  * find_get_entries - gang pagecache lookup
@@ -2021,11 +2650,19 @@ reset:
  *
  * Return: The number of entries which were found.
  */
+
+unsigned cc_find_get_entries(struct address_space *mapping, pgoff_t *start,
+		pgoff_t end, struct folio_batch *fbatch, pgoff_t *indices);
+
 unsigned find_get_entries(struct address_space *mapping, pgoff_t *start,
 		pgoff_t end, struct folio_batch *fbatch, pgoff_t *indices)
 {
 	XA_STATE(xas, &mapping->i_pages, *start);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_find_get_entries(mapping, start, end, fbatch, indices);
+
 
 	rcu_read_lock();
 	while ((folio = find_get_entry(&xas, end, XA_PRESENT)) != NULL) {
@@ -2041,6 +2678,32 @@ unsigned find_get_entries(struct address_space *mapping, pgoff_t *start,
 
 		folio = fbatch->folios[idx];
 		if (!xa_is_value(folio) && !folio_test_hugetlb(folio))
+			nr = folio_nr_pages(folio);
+		*start = indices[idx] + nr;
+	}
+	return folio_batch_count(fbatch);
+}
+
+unsigned cc_find_get_entries(struct address_space *mapping, pgoff_t *start,
+		pgoff_t end, struct folio_batch *fbatch, pgoff_t *indices)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), *start);
+	struct folio *folio;
+
+	// rcu_read_lock();
+	while ((folio = cc_find_get_entry(&xas, end, XA_PRESENT)) != NULL) {
+		indices[fbatch->nr] = xas.xa_index;
+		if (!folio_batch_add(fbatch, folio))
+			break;
+	}
+	// rcu_read_unlock();
+
+	if (folio_batch_count(fbatch)) {
+		unsigned long nr = 1;
+		int idx = folio_batch_count(fbatch) - 1;
+
+		folio = fbatch->folios[idx];
+		if (!cc_xa_is_value(folio) && !folio_test_hugetlb(folio))
 			nr = folio_nr_pages(folio);
 		*start = indices[idx] + nr;
 	}
@@ -2067,11 +2730,17 @@ unsigned find_get_entries(struct address_space *mapping, pgoff_t *start,
  *
  * Return: The number of entries which were found.
  */
+
+unsigned cc_find_lock_entries(struct address_space *mapping, pgoff_t *start,
+		pgoff_t end, struct folio_batch *fbatch, pgoff_t *indices);
 unsigned find_lock_entries(struct address_space *mapping, pgoff_t *start,
 		pgoff_t end, struct folio_batch *fbatch, pgoff_t *indices)
 {
 	XA_STATE(xas, &mapping->i_pages, *start);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_find_lock_entries(mapping, start, end ,fbatch, indices);
 
 	rcu_read_lock();
 	while ((folio = find_get_entry(&xas, end, XA_PRESENT))) {
@@ -2111,6 +2780,51 @@ put:
 	return folio_batch_count(fbatch);
 }
 
+unsigned cc_find_lock_entries(struct address_space *mapping, pgoff_t *start,
+		pgoff_t end, struct folio_batch *fbatch, pgoff_t *indices)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), *start);
+	struct folio *folio;
+
+	// rcu_read_lock();
+	while ((folio = cc_find_get_entry(&xas, end, XA_PRESENT))) {
+		if (!cc_xa_is_value(folio)) {
+			if (folio->index < *start)
+				goto put;
+			if (folio_next_index(folio) - 1 > end)
+				goto put;
+			if (!folio_trylock(folio))
+				goto put;
+			if (folio->mapping != mapping ||
+			    folio_test_writeback(folio))
+				goto unlock;
+			VM_BUG_ON_FOLIO(!folio_contains(folio, xas.xa_index),
+					folio);
+		}
+		indices[fbatch->nr] = xas.xa_index;
+		if (!folio_batch_add(fbatch, folio))
+			break;
+		continue;
+unlock:
+		folio_unlock(folio);
+put:
+		folio_put(folio);
+	}
+	// rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
+
+	if (folio_batch_count(fbatch)) {
+		unsigned long nr = 1;
+		int idx = folio_batch_count(fbatch) - 1;
+
+		folio = fbatch->folios[idx];
+		if (!xa_is_value(folio) && !folio_test_hugetlb(folio))
+			nr = folio_nr_pages(folio);
+		*start = indices[idx] + nr;
+	}
+	return folio_batch_count(fbatch);
+}
+
 /**
  * filemap_get_folios - Get a batch of folios
  * @mapping:	The address_space to search
@@ -2132,11 +2846,16 @@ put:
  * Return: The number of folios which were found.
  * We also update @start to index the next folio for the traversal.
  */
+unsigned cc_filemap_get_folios(struct address_space *mapping, pgoff_t *start,
+		pgoff_t end, struct folio_batch *fbatch);
 unsigned filemap_get_folios(struct address_space *mapping, pgoff_t *start,
 		pgoff_t end, struct folio_batch *fbatch)
 {
 	XA_STATE(xas, &mapping->i_pages, *start);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_filemap_get_folios(mapping, start, end, fbatch);
 
 	rcu_read_lock();
 	while ((folio = find_get_entry(&xas, end, XA_PRESENT)) != NULL) {
@@ -2170,6 +2889,44 @@ out:
 }
 EXPORT_SYMBOL(filemap_get_folios);
 
+unsigned cc_filemap_get_folios(struct address_space *mapping, pgoff_t *start,
+		pgoff_t end, struct folio_batch *fbatch)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), *start);
+	struct folio *folio;
+
+	//rcu_read_lock();
+	while ((folio = cc_find_get_entry(&xas, end, CC_XA_PRESENT)) != NULL) {
+		/* Skip over shadow, swap and DAX entries */
+		if (cc_xa_is_value(folio))
+			continue;
+		if (!folio_batch_add(fbatch, folio)) {
+			unsigned long nr = folio_nr_pages(folio);
+
+			if (folio_test_hugetlb(folio))
+				nr = 1;
+			*start = folio->index + nr;
+			goto out;
+		}
+	}
+
+	/*
+	 * We come here when there is no page beyond @end. We take care to not
+	 * overflow the index @start as it confuses some of the callers. This
+	 * breaks the iteration when there is a page at index -1 but that is
+	 * already broken anyway.
+	 */
+	if (end == (pgoff_t)-1)
+		*start = (pgoff_t)-1;
+	else
+		*start = end + 1;
+out:
+	//rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
+	return folio_batch_count(fbatch);
+}
+EXPORT_SYMBOL(cc_filemap_get_folios);
+
 /**
  * filemap_get_folios_contig - Get a batch of contiguous folios
  * @mapping:	The address_space to search
@@ -2184,6 +2941,8 @@ EXPORT_SYMBOL(filemap_get_folios);
  * Return: The number of folios found.
  * Also update @start to be positioned for traversal of the next folio.
  */
+unsigned cc_filemap_get_folios_contig(struct address_space *mapping,
+		pgoff_t *start, pgoff_t end, struct folio_batch *fbatch);
 
 unsigned filemap_get_folios_contig(struct address_space *mapping,
 		pgoff_t *start, pgoff_t end, struct folio_batch *fbatch)
@@ -2191,6 +2950,9 @@ unsigned filemap_get_folios_contig(struct address_space *mapping,
 	XA_STATE(xas, &mapping->i_pages, *start);
 	unsigned long nr;
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_filemap_get_folios_contig(mapping, start, end, fbatch);
 
 	rcu_read_lock();
 
@@ -2243,6 +3005,66 @@ out:
 }
 EXPORT_SYMBOL(filemap_get_folios_contig);
 
+unsigned cc_filemap_get_folios_contig(struct address_space *mapping,
+		pgoff_t *start, pgoff_t end, struct folio_batch *fbatch)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), *start);
+	unsigned long nr;
+	struct folio *folio;
+
+	// rcu_read_lock();
+
+	for (folio = cc_xas_load(&xas, true); folio && xas.xa_index <= end;
+			folio = cc_xas_next(&xas)) {
+		if (cc_xas_retry(&xas, folio))
+			continue;
+		/*
+		 * If the entry has been swapped out, we can stop looking.
+		 * No current caller is looking for DAX entries.
+		 */
+		if (cc_xa_is_value(folio))
+			goto update_start;
+
+		if (!folio_try_get_rcu(folio))
+			goto retry;
+
+		if (unlikely(folio != cc_xas_reload(&xas)))
+			goto put_folio;
+
+		if (!folio_batch_add(fbatch, folio)) {
+			nr = folio_nr_pages(folio);
+
+			if (folio_test_hugetlb(folio))
+				nr = 1;
+			*start = folio->index + nr;
+			goto out;
+		}
+		continue;
+put_folio:
+		folio_put(folio);
+
+retry:
+		cc_xas_reset(&xas);
+	}
+
+update_start:
+	nr = folio_batch_count(fbatch);
+
+	if (nr) {
+		folio = fbatch->folios[nr - 1];
+		if (folio_test_hugetlb(folio))
+			*start = folio->index + 1;
+		else
+			*start = folio_next_index(folio);
+	}
+out:
+	//rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
+
+	return folio_batch_count(fbatch);
+}
+EXPORT_SYMBOL(cc_filemap_get_folios_contig);
+
 /**
  * filemap_get_folios_tag - Get a batch of folios matching @tag
  * @mapping:    The address_space to search
@@ -2256,11 +3078,17 @@ EXPORT_SYMBOL(filemap_get_folios_contig);
  * Return: The number of folios found.
  * Also update @start to index the next folio for traversal.
  */
+unsigned cc_filemap_get_folios_tag(struct address_space *mapping, pgoff_t *start,
+			pgoff_t end, xa_mark_t tag, struct folio_batch *fbatch);
+
 unsigned filemap_get_folios_tag(struct address_space *mapping, pgoff_t *start,
 			pgoff_t end, xa_mark_t tag, struct folio_batch *fbatch)
 {
 	XA_STATE(xas, &mapping->i_pages, *start);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas))
+                return cc_filemap_get_folios_tag(mapping, start, end, tag, fbatch);
 
 	rcu_read_lock();
 	while ((folio = find_get_entry(&xas, end, tag)) != NULL) {
@@ -2297,7 +3125,48 @@ out:
 }
 EXPORT_SYMBOL(filemap_get_folios_tag);
 
-/*
+unsigned cc_filemap_get_folios_tag(struct address_space *mapping, pgoff_t *start,
+			pgoff_t end, xa_mark_t tag, struct folio_batch *fbatch)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), *start);
+	struct folio *folio;
+
+	//rcu_read_lock();
+	while ((folio = cc_find_get_entry(&xas, end, tag)) != NULL) {
+		/*
+		 * Shadow entries should never be tagged, but this iteration
+		 * is lockless so there is a window for page reclaim to evict
+		 * a page we saw tagged. Skip over it.
+		 */
+		if (cc_xa_is_value(folio))
+			continue;
+		if (!folio_batch_add(fbatch, folio)) {
+			unsigned long nr = folio_nr_pages(folio);
+
+			if (folio_test_hugetlb(folio))
+				nr = 1;
+			*start = folio->index + nr;
+			goto out;
+		}
+	}
+	/*
+	 * We come here when there is no page beyond @end. We take care to not
+	 * overflow the index @start as it confuses some of the callers. This
+	 * breaks the iteration when there is a page at index -1 but that is
+	 * already broke anyway.
+	 */
+	if (end == (pgoff_t)-1)
+		*start = (pgoff_t)-1;
+	else
+		*start = end + 1;
+out:
+	//rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
+	return folio_batch_count(fbatch);
+}
+EXPORT_SYMBOL(cc_filemap_get_folios_tag);
+
+/**
  * CD/DVDs are error prone. When a medium error occurs, the driver may fail
  * a _large_ part of the i/o request. Imagine the worst scenario:
  *
@@ -2326,11 +3195,16 @@ static void shrink_readahead_size_eio(struct file_ra_state *ra)
  * folio in the batch may have the readahead flag set or the uptodate flag
  * clear so that the caller can take the appropriate action.
  */
+static void cc_filemap_get_read_batch(struct address_space *mapping,
+		pgoff_t index, pgoff_t max, struct folio_batch *fbatch);
 static void filemap_get_read_batch(struct address_space *mapping,
 		pgoff_t index, pgoff_t max, struct folio_batch *fbatch)
 {
 	XA_STATE(xas, &mapping->i_pages, index);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_filemap_get_read_batch(mapping, index, max, fbatch);
 
 	rcu_read_lock();
 	for (folio = xas_load(&xas); folio; folio = xas_next(&xas)) {
@@ -2360,6 +3234,43 @@ retry:
 		xas_reset(&xas);
 	}
 	rcu_read_unlock();
+}
+
+static void cc_filemap_get_read_batch(struct address_space *mapping,
+		pgoff_t index, pgoff_t max, struct folio_batch *fbatch)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+	struct folio *folio;
+
+	//rcu_read_lock();
+	for (folio = cc_xas_load(&xas, true); folio; folio = cc_xas_next(&xas)) {
+		if (cc_xas_retry(&xas, folio))
+			continue;
+		if (xas.xa_index > max || xa_is_value(folio))
+			break;
+		if (xa_is_sibling(folio))
+			break;
+		if (!folio_try_get_rcu(folio))
+			goto retry;
+
+		if (unlikely(folio != cc_xas_reload(&xas)))
+			goto put_folio;
+
+		if (!folio_batch_add(fbatch, folio))
+			break;
+		if (!folio_test_uptodate(folio))
+			break;
+		if (folio_test_readahead(folio))
+			break;
+		cc_xas_advance(&xas, folio_next_index(folio) - 1);
+		continue;
+put_folio:
+		folio_put(folio);
+retry:
+		cc_xas_reset(&xas);
+	}
+	// rcu_read_unlock();
+	cc_xas_reset(&xas);
 }
 
 static int filemap_read_folio(struct file *file, filler_t filler,
@@ -2978,10 +3889,16 @@ out:
 }
 EXPORT_SYMBOL(filemap_splice_read);
 
+static inline loff_t cc_folio_seek_hole_data(struct cc_xa_state *xas,
+		struct address_space *mapping, struct folio *folio,
+		loff_t start, loff_t end, bool seek_data);
 static inline loff_t folio_seek_hole_data(struct xa_state *xas,
 		struct address_space *mapping, struct folio *folio,
 		loff_t start, loff_t end, bool seek_data)
 {
+	if (cc_xas_is_ccxarray(xas))
+		printk(KERN_ERR "[%s] need to check (%pS) \n", __func__, __builtin_return_address(0));
+
 	const struct address_space_operations *ops = mapping->a_ops;
 	size_t offset, bsz = i_blocksize(mapping->host);
 
@@ -3011,10 +3928,53 @@ unlock:
 	return start;
 }
 
+static inline loff_t cc_folio_seek_hole_data(struct cc_xa_state *xas,
+		struct address_space *mapping, struct folio *folio,
+		loff_t start, loff_t end, bool seek_data)
+{
+	const struct address_space_operations *ops = mapping->a_ops;
+	size_t offset, bsz = i_blocksize(mapping->host);
+
+	if (cc_xa_is_value(folio) || folio_test_uptodate(folio))
+		return seek_data ? start : end;
+	if (!ops->is_partially_uptodate)
+		return seek_data ? end : start;
+
+	cc_xas_pause(xas);
+	rcu_read_unlock();
+	folio_lock(folio);
+	if (unlikely(folio->mapping != mapping))
+		goto unlock;
+
+	offset = offset_in_folio(folio, start) & ~(bsz - 1);
+
+	do {
+		if (ops->is_partially_uptodate(folio, offset, bsz) ==
+							seek_data)
+			break;
+		start = (start + bsz) & ~(bsz - 1);
+		offset += bsz;
+	} while (offset < folio_size(folio));
+unlock:
+	folio_unlock(folio);
+	rcu_read_lock();
+	return start;
+}
+
+static inline size_t cc_seek_folio_size(struct cc_xa_state *xas, struct folio *folio);
 static inline size_t seek_folio_size(struct xa_state *xas, struct folio *folio)
 {
+	if (cc_xas_is_ccxarray(xas))
+		printk(KERN_ERR "[%s] need to check (%pS) \n", __func__, __builtin_return_address(0));
+
 	if (xa_is_value(folio))
 		return PAGE_SIZE << xa_get_order(xas->xa, xas->xa_index);
+	return folio_size(folio);
+}
+static inline size_t cc_seek_folio_size(struct cc_xa_state *xas, struct folio *folio)
+{	
+	if (xa_is_value(folio))
+		return PAGE_SIZE << cc_xa_get_order(xas->xa, xas->xa_index);
 	return folio_size(folio);
 }
 
@@ -3036,6 +3996,8 @@ static inline size_t seek_folio_size(struct xa_state *xas, struct folio *folio)
  * after @end - 1, so SEEK_HOLE returns @end if all the bytes between @start
  * and @end contain data.
  */
+loff_t cc_mapping_seek_hole_data(struct address_space *mapping, loff_t start,
+		loff_t end, int whence);
 loff_t mapping_seek_hole_data(struct address_space *mapping, loff_t start,
 		loff_t end, int whence)
 {
@@ -3043,6 +4005,9 @@ loff_t mapping_seek_hole_data(struct address_space *mapping, loff_t start,
 	pgoff_t max = (end - 1) >> PAGE_SHIFT;
 	bool seek_data = (whence == SEEK_DATA);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_mapping_seek_hole_data(mapping, start, end, whence);
 
 	if (end <= start)
 		return -ENXIO;
@@ -3076,6 +4041,53 @@ loff_t mapping_seek_hole_data(struct address_space *mapping, loff_t start,
 unlock:
 	rcu_read_unlock();
 	if (folio && !xa_is_value(folio))
+		folio_put(folio);
+	if (start > end)
+		return end;
+	return start;
+}
+
+loff_t cc_mapping_seek_hole_data(struct address_space *mapping, loff_t start,
+		loff_t end, int whence)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), start >> PAGE_SHIFT);
+	pgoff_t max = (end - 1) >> PAGE_SHIFT;
+	bool seek_data = (whence == SEEK_DATA);
+	struct folio *folio;
+
+	if (end <= start)
+		return -ENXIO;
+
+	// rcu_read_lock();
+	while ((folio = cc_find_get_entry(&xas, max, CC_XA_PRESENT))) {
+		loff_t pos = (u64)xas.xa_index << PAGE_SHIFT;
+		size_t seek_size;
+
+		if (start < pos) {
+			if (!seek_data)
+				goto unlock;
+			start = pos;
+		}
+
+		seek_size = cc_seek_folio_size(&xas, folio);
+		pos = round_up((u64)pos + 1, seek_size);
+		start = cc_folio_seek_hole_data(&xas, mapping, folio, start, pos,
+				seek_data);
+		if (start < pos)
+			goto unlock;
+		if (start >= end)
+			break;
+		if (seek_size > PAGE_SIZE)
+			cc_xas_set(&xas, pos >> PAGE_SHIFT);
+		if (!xa_is_value(folio))
+			folio_put(folio);
+	}
+	if (seek_data)
+		start = -ENXIO;
+unlock:
+	//rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
+	if (folio && !cc_xa_is_value(folio))
 		folio_put(folio);
 	if (start > end)
 		return end;
@@ -3428,6 +4440,8 @@ static bool filemap_map_pmd(struct vm_fault *vmf, struct folio *folio,
 	return false;
 }
 
+static struct folio *cc_next_uptodate_folio(struct cc_xa_state *xas,
+		struct address_space *mapping, pgoff_t end_pgoff);
 static struct folio *next_uptodate_folio(struct xa_state *xas,
 		struct address_space *mapping, pgoff_t end_pgoff)
 {
@@ -3465,6 +4479,47 @@ unlock:
 skip:
 		folio_put(folio);
 	} while ((folio = xas_next_entry(xas, end_pgoff)) != NULL);
+
+	return NULL;
+}
+
+static struct folio *cc_next_uptodate_folio(struct cc_xa_state *xas,
+		struct address_space *mapping, pgoff_t end_pgoff)
+{
+	struct folio *folio = cc_xas_next_entry(xas, end_pgoff);
+	unsigned long max_idx;
+
+	do {
+		if (!folio)
+			return NULL;
+		if (cc_xas_retry(xas, folio))
+			continue;
+		if (cc_xa_is_value(folio))
+			continue;
+		if (folio_test_locked(folio))
+			continue;
+		if (!folio_try_get_rcu(folio))
+			continue;
+		/* Has the page moved or been split? */
+		if (unlikely(folio != cc_xas_reload(xas)))
+			goto skip;
+		if (!folio_test_uptodate(folio) || folio_test_readahead(folio))
+			goto skip;
+		if (!folio_trylock(folio))
+			goto skip;
+		if (folio->mapping != mapping)
+			goto unlock;
+		if (!folio_test_uptodate(folio))
+			goto unlock;
+		max_idx = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE);
+		if (xas->xa_index >= max_idx)
+			goto unlock;
+		return folio;
+unlock:
+		folio_unlock(folio);
+skip:
+		folio_put(folio);
+	} while ((folio = cc_xas_next_entry(xas, end_pgoff)) != NULL);
 
 	return NULL;
 }
@@ -3555,6 +4610,8 @@ static vm_fault_t filemap_map_order0_folio(struct vm_fault *vmf,
 	return ret;
 }
 
+vm_fault_t cc_filemap_map_pages(struct vm_fault *vmf,
+			     pgoff_t start_pgoff, pgoff_t end_pgoff);
 vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 			     pgoff_t start_pgoff, pgoff_t end_pgoff)
 {
@@ -3567,6 +4624,9 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 	struct folio *folio;
 	vm_fault_t ret = 0;
 	unsigned int nr_pages = 0, mmap_miss = 0, mmap_miss_saved;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_filemap_map_pages(vmf, start_pgoff, end_pgoff);
 
 	rcu_read_lock();
 	folio = next_uptodate_folio(&xas, mapping, end_pgoff);
@@ -3618,6 +4678,71 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL(filemap_map_pages);
+
+vm_fault_t cc_filemap_map_pages(struct vm_fault *vmf,
+			     pgoff_t start_pgoff, pgoff_t end_pgoff)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct file *file = vma->vm_file;
+	struct address_space *mapping = file->f_mapping;
+	pgoff_t last_pgoff = start_pgoff;
+	unsigned long addr;
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), start_pgoff);
+	struct folio *folio;
+	vm_fault_t ret = 0;
+	unsigned int nr_pages = 0, mmap_miss = 0, mmap_miss_saved;
+
+	//rcu_read_lock();
+	folio = cc_next_uptodate_folio(&xas, mapping, end_pgoff);
+	if (!folio)
+		goto out;
+
+	if (filemap_map_pmd(vmf, folio, start_pgoff)) {
+		ret = VM_FAULT_NOPAGE;
+		goto out;
+	}
+
+	addr = vma->vm_start + ((start_pgoff - vma->vm_pgoff) << PAGE_SHIFT);
+	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, addr, &vmf->ptl);
+	if (!vmf->pte) {
+		folio_unlock(folio);
+		folio_put(folio);
+		goto out;
+	}
+	do {
+		unsigned long end;
+
+		addr += (xas.xa_index - last_pgoff) << PAGE_SHIFT;
+		vmf->pte += xas.xa_index - last_pgoff;
+		last_pgoff = xas.xa_index;
+		end = folio->index + folio_nr_pages(folio) - 1;
+		nr_pages = min(end, end_pgoff) - xas.xa_index + 1;
+
+		if (!folio_test_large(folio))
+			ret |= filemap_map_order0_folio(vmf,
+					folio, addr, &mmap_miss);
+		else
+			ret |= filemap_map_folio_range(vmf, folio,
+					xas.xa_index - folio->index, addr,
+					nr_pages, &mmap_miss);
+
+		folio_unlock(folio);
+		folio_put(folio);
+	} while ((folio = cc_next_uptodate_folio(&xas, mapping, end_pgoff)) != NULL);
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+out:
+	//rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
+
+	mmap_miss_saved = READ_ONCE(file->f_ra.mmap_miss);
+	if (mmap_miss >= mmap_miss_saved)
+		WRITE_ONCE(file->f_ra.mmap_miss, 0);
+	else
+		WRITE_ONCE(file->f_ra.mmap_miss, mmap_miss_saved - mmap_miss);
+
+	return ret;
+}
+EXPORT_SYMBOL(cc_filemap_map_pages);
 
 vm_fault_t filemap_page_mkwrite(struct vm_fault *vmf)
 {
@@ -4142,11 +5267,17 @@ EXPORT_SYMBOL(filemap_release_folio);
  * queried include: number of dirty pages, number of pages marked for
  * writeback, and the number of (recently) evicted pages.
  */
+
+static void cc_filemap_cachestat(struct address_space *mapping,
+		pgoff_t first_index, pgoff_t last_index, struct cachestat *cs);
 static void filemap_cachestat(struct address_space *mapping,
 		pgoff_t first_index, pgoff_t last_index, struct cachestat *cs)
 {
 	XA_STATE(xas, &mapping->i_pages, first_index);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return filemap_cachestat(mapping, first_index, last_index, cs);
 
 	rcu_read_lock();
 	xas_for_each(&xas, folio, last_index) {
@@ -4216,6 +5347,82 @@ resched:
 		}
 	}
 	rcu_read_unlock();
+}
+static void cc_filemap_cachestat(struct address_space *mapping,
+		pgoff_t first_index, pgoff_t last_index, struct cachestat *cs)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), first_index);
+	struct folio *folio;
+
+	//rcu_read_lock();
+	cc_xas_for_each(&xas, folio, last_index) {
+		unsigned long nr_pages;
+		pgoff_t folio_first_index, folio_last_index;
+
+		if (cc_xas_retry(&xas, folio))
+			continue;
+
+		if (cc_xa_is_value(folio)) {
+			/* page is evicted */
+			void *shadow = (void *)folio;
+			bool workingset; /* not used */
+			int order = cc_xa_get_order(xas.xa, xas.xa_index);
+
+			nr_pages = 1 << order;
+			folio_first_index = round_down(xas.xa_index, 1 << order);
+			folio_last_index = folio_first_index + nr_pages - 1;
+
+			/* Folios might straddle the range boundaries, only count covered pages */
+			if (folio_first_index < first_index)
+				nr_pages -= first_index - folio_first_index;
+
+			if (folio_last_index > last_index)
+				nr_pages -= folio_last_index - last_index;
+
+			cs->nr_evicted += nr_pages;
+
+#ifdef CONFIG_SWAP /* implies CONFIG_MMU */
+			if (shmem_mapping(mapping)) {
+				/* shmem file - in swap cache */
+				swp_entry_t swp = radix_to_swp_entry(folio);
+
+				shadow = get_shadow_from_swap_cache(swp);
+			}
+#endif
+			if (workingset_test_recent(shadow, true, &workingset))
+				cs->nr_recently_evicted += nr_pages;
+
+			goto resched;
+		}
+
+		nr_pages = folio_nr_pages(folio);
+		folio_first_index = folio_pgoff(folio);
+		folio_last_index = folio_first_index + nr_pages - 1;
+
+		/* Folios might straddle the range boundaries, only count covered pages */
+		if (folio_first_index < first_index)
+			nr_pages -= first_index - folio_first_index;
+
+		if (folio_last_index > last_index)
+			nr_pages -= folio_last_index - last_index;
+
+		/* page is in cache */
+		cs->nr_cache += nr_pages;
+
+		if (folio_test_dirty(folio))
+			cs->nr_dirty += nr_pages;
+
+		if (folio_test_writeback(folio))
+			cs->nr_writeback += nr_pages;
+
+resched:
+		if (need_resched()) {
+			cc_xas_pause(&xas);
+			cond_resched_rcu();
+		}
+	}
+	//rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
 }
 
 /*
