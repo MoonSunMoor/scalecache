@@ -546,6 +546,36 @@ static int grab_super(struct super_block *s) __releases(sb_lock)
 	return 0;
 }
 
+/*
+ *	trylock_super - try to grab ->s_umount shared
+ *	@sb: reference we are trying to grab
+ *
+ *	Try to prevent fs shutdown.  This is used in places where we
+ *	cannot take an active reference but we need to ensure that the
+ *	filesystem is not shut down while we are working on it. It returns
+ *	false if we cannot acquire s_umount or if we lose the race and
+ *	filesystem already got into shutdown, and returns true with the s_umount
+ *	lock held in read mode in case of success. On successful return,
+ *	the caller must drop the s_umount lock when done.
+ *
+ *	Note that unlike get_super() et.al. this one does *not* bump ->s_count.
+ *	The reason why it's safe is that we are OK with doing trylock instead
+ *	of down_read().  There's a couple of places that are OK with that, but
+ *	it's very much not a general-purpose interface.
+ */
+bool trylock_super(struct super_block *sb)
+{
+	if (down_read_trylock(&sb->s_umount)) {
+		if (!hlist_unhashed(&sb->s_instances) &&
+		    sb->s_root && (sb->s_flags & SB_BORN))
+			return true;
+		up_read(&sb->s_umount);
+	}
+
+	return false;
+}
+EXPORT_SYMBOL(trylock_super);
+
 static inline bool wait_dead(struct super_block *sb)
 {
 	unsigned int flags;
@@ -613,6 +643,7 @@ bool super_trylock_shared(struct super_block *sb)
 
 	return false;
 }
+EXPORT_SYMBOL_GPL(super_trylock_shared);
 
 /**
  *	retire_super	-	prevents superblock from being reused

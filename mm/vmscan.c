@@ -189,8 +189,9 @@ struct scan_control {
 int vm_swappiness = 60;
 
 LIST_HEAD(shrinker_list);
+EXPORT_SYMBOL(shrinker_list);
 DECLARE_RWSEM(shrinker_rwsem);
-
+EXPORT_SYMBOL(shrinker_rwsem);
 #ifdef CONFIG_MEMCG
 static int shrinker_nr_max;
 
