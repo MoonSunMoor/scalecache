@@ -104,6 +104,8 @@ static noinline void check_xas_retry(struct xarray *xa)
 	XA_STATE(xas, xa, 0);
 	void *entry;
 
+	printk("sizeof node->slots %d\n", sizeof(xas.xa_node->slots)/sizeof(void*));
+
 	xa_store_index(xa, 0, GFP_KERNEL);
 	xa_store_index(xa, 1, GFP_KERNEL);
 
@@ -142,6 +144,7 @@ static noinline void check_xas_retry(struct xarray *xa)
 
 	xa_erase_index(xa, 0);
 	xa_erase_index(xa, 1);
+	xa_dump(xa);
 }
 
 static noinline void check_xa_load(struct xarray *xa)

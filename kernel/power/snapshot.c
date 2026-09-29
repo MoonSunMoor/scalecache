@@ -1042,6 +1042,7 @@ void swsusp_set_page_free(struct page *page)
 	if (free_pages_map)
 		memory_bm_set_bit(free_pages_map, page_to_pfn(page));
 }
+EXPORT_SYMBOL(swsusp_set_page_free);
 
 static int swsusp_page_is_free(struct page *page)
 {
@@ -1054,6 +1055,7 @@ void swsusp_unset_page_free(struct page *page)
 	if (free_pages_map)
 		memory_bm_clear_bit(free_pages_map, page_to_pfn(page));
 }
+EXPORT_SYMBOL(swsusp_unset_page_free);
 
 static void swsusp_set_page_forbidden(struct page *page)
 {
@@ -1066,6 +1068,7 @@ int swsusp_page_is_forbidden(struct page *page)
 	return forbidden_pages_map ?
 		memory_bm_test_bit(forbidden_pages_map, page_to_pfn(page)) : 0;
 }
+EXPORT_SYMBOL(swsusp_page_is_forbidden);
 
 static void swsusp_unset_page_forbidden(struct page *page)
 {

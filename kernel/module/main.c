@@ -3353,6 +3353,7 @@ void print_modules(void)
 			last_unloaded_module.taints);
 	pr_cont("\n");
 }
+EXPORT_SYMBOL_GPL(print_modules);
 
 #ifdef CONFIG_MODULE_DEBUGFS
 struct dentry *mod_debugfs_root;

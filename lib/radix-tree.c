@@ -33,6 +33,7 @@
  * Radix tree node cache.
  */
 struct kmem_cache *radix_tree_node_cachep;
+EXPORT_SYMBOL(radix_tree_node_cachep);
 
 /*
  * The radix tree is variable-height, so an insert operation not only has
@@ -303,6 +304,7 @@ void radix_tree_node_rcu_free(struct rcu_head *head)
 
 	kmem_cache_free(radix_tree_node_cachep, node);
 }
+EXPORT_SYMBOL(radix_tree_node_rcu_free);
 
 static inline void
 radix_tree_node_free(struct radix_tree_node *node)
