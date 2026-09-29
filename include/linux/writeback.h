@@ -381,4 +381,6 @@ bool redirty_page_for_writepage(struct writeback_control *, struct page *);
 void sb_mark_inode_writeback(struct inode *inode);
 void sb_clear_inode_writeback(struct inode *inode);
 
+long wb_do_writeback(struct bdi_writeback *wb);
+
 #endif		/* WRITEBACK_H */

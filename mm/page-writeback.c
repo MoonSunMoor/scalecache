@@ -42,6 +42,8 @@
 
 #include "internal.h"
 
+EXPORT_TRACEPOINT_SYMBOL_GPL(bdi_dirty_ratelimit);
+
 /*
  * Sleep at most 200ms at a time in balance_dirty_pages().
  */
@@ -60,24 +62,31 @@
 
 #define RATELIMIT_CALC_SHIFT	10
 
+// GeonWoo
+unsigned long totalreserve_pages __read_mostly;
+EXPORT_SYMBOL_GPL(totalreserve_pages);
+
 /*
  * After a CPU has dirtied this many pages, balance_dirty_pages_ratelimited
  * will look to see if it needs to force writeback or throttling.
  */
-static long ratelimit_pages = 32;
+long ratelimit_pages = 32;
+EXPORT_SYMBOL_GPL(ratelimit_pages);
 
 /* The following parameters are exported via /proc/sys/vm */
 
 /*
  * Start background writeback (via writeback threads) at this percentage
  */
-static int dirty_background_ratio = 10;
+int dirty_background_ratio = 10;
+EXPORT_SYMBOL_GPL(dirty_background_ratio);
 
 /*
  * dirty_background_bytes starts at 0 (disabled) so that it is a function of
  * dirty_background_ratio * the amount of dirtyable memory
  */
-static unsigned long dirty_background_bytes;
+unsigned long dirty_background_bytes;
+EXPORT_SYMBOL_GPL(dirty_background_bytes);
 
 /*
  * free highmem will not be subtracted from the total free memory
@@ -88,13 +97,15 @@ static int vm_highmem_is_dirtyable;
 /*
  * The generator of dirty data starts writeback at this percentage
  */
-static int vm_dirty_ratio = 20;
+int vm_dirty_ratio = 20;
+EXPORT_SYMBOL_GPL(vm_dirty_ratio);
 
 /*
  * vm_dirty_bytes starts at 0 (disabled) so that it is a function of
  * vm_dirty_ratio * the amount of dirtyable memory
  */
-static unsigned long vm_dirty_bytes;
+unsigned long vm_dirty_bytes;
+EXPORT_SYMBOL_GPL(vm_dirty_bytes);
 
 /*
  * The interval between `kupdate'-style writebacks
@@ -107,6 +118,7 @@ EXPORT_SYMBOL_GPL(dirty_writeback_interval);
  * The longest time for which data is allowed to remain dirty
  */
 unsigned int dirty_expire_interval = 30 * 100; /* centiseconds */
+EXPORT_SYMBOL_GPL(dirty_expire_interval);
 
 /*
  * Flag that puts the machine in "laptop mode". Doubles as a timeout in jiffies:
@@ -119,6 +131,7 @@ EXPORT_SYMBOL(laptop_mode);
 /* End of sysctl-exported parameters */
 
 struct wb_domain global_wb_domain;
+EXPORT_SYMBOL_GPL(global_wb_domain);
 
 /* consolidated parameters for balance_dirty_pages() and its subroutines */
 struct dirty_throttle_control {
@@ -342,7 +355,7 @@ static unsigned long highmem_dirtyable_memory(unsigned long total)
  * Return: the global number of pages potentially available for dirty
  * page cache.  This is the base value for the global dirty limits.
  */
-static unsigned long global_dirtyable_memory(void)
+unsigned long global_dirtyable_memory(void)
 {
 	unsigned long x;
 
@@ -362,6 +375,7 @@ static unsigned long global_dirtyable_memory(void)
 
 	return x + 1;	/* Ensure that we never return 0 */
 }
+EXPORT_SYMBOL_GPL(global_dirtyable_memory);
 
 /**
  * domain_dirty_limits - calculate thresh and bg_thresh for a wb_domain
@@ -372,7 +386,7 @@ static unsigned long global_dirtyable_memory(void)
  * must ensure that @dtc->avail is set before calling this function.  The
  * dirty limits will be lifted by 1/4 for real-time tasks.
  */
-static void domain_dirty_limits(struct dirty_throttle_control *dtc)
+void domain_dirty_limits(struct dirty_throttle_control *dtc)
 {
 	const unsigned long available_memory = dtc->avail;
 	struct dirty_throttle_control *gdtc = mdtc_gdtc(dtc);
@@ -429,6 +443,7 @@ static void domain_dirty_limits(struct dirty_throttle_control *dtc)
 	if (!gdtc)
 		trace_global_dirty_state(bg_thresh, thresh);
 }
+EXPORT_SYMBOL_GPL(domain_dirty_limits);
 
 /**
  * global_dirty_limits - background-writeback and dirty-throttling thresholds
@@ -649,7 +664,8 @@ void wb_domain_exit(struct wb_domain *dom)
  * registered backing devices, which, for obvious reasons, can not
  * exceed 100%.
  */
-static unsigned int bdi_min_ratio;
+unsigned int bdi_min_ratio;
+EXPORT_SYMBOL_GPL(bdi_min_ratio);
 
 static int bdi_check_pages_limit(unsigned long pages)
 {
@@ -810,11 +826,12 @@ int bdi_set_strict_limit(struct backing_dev_info *bdi, unsigned int strict_limit
 	return 0;
 }
 
-static unsigned long dirty_freerun_ceiling(unsigned long thresh,
+unsigned long dirty_freerun_ceiling(unsigned long thresh,
 					   unsigned long bg_thresh)
 {
 	return (thresh + bg_thresh) / 2;
 }
+EXPORT_SYMBOL_GPL(dirty_freerun_ceiling);
 
 static unsigned long hard_dirty_limit(struct wb_domain *dom,
 				      unsigned long thresh)
@@ -826,7 +843,7 @@ static unsigned long hard_dirty_limit(struct wb_domain *dom,
  * Memory which can be further allocated to a memcg domain is capped by
  * system-wide clean memory excluding the amount being used in the domain.
  */
-static void mdtc_calc_avail(struct dirty_throttle_control *mdtc,
+void mdtc_calc_avail(struct dirty_throttle_control *mdtc,
 			    unsigned long filepages, unsigned long headroom)
 {
 	struct dirty_throttle_control *gdtc = mdtc_gdtc(mdtc);
@@ -836,6 +853,7 @@ static void mdtc_calc_avail(struct dirty_throttle_control *mdtc,
 
 	mdtc->avail = filepages + min(headroom, other_clean);
 }
+EXPORT_SYMBOL_GPL(mdtc_calc_avail);
 
 /**
  * __wb_calc_thresh - @wb's share of dirty throttling threshold
@@ -998,7 +1016,7 @@ static long long pos_ratio_polynom(unsigned long setpoint,
  *   card's wb_dirty may rush to many times higher than wb_setpoint.
  * - the wb dirty thresh drops quickly due to change of JBOD workload
  */
-static void wb_position_ratio(struct dirty_throttle_control *dtc)
+void wb_position_ratio(struct dirty_throttle_control *dtc)
 {
 	struct bdi_writeback *wb = dtc->wb;
 	unsigned long write_bw = READ_ONCE(wb->avg_write_bandwidth);
@@ -1176,6 +1194,7 @@ static void wb_position_ratio(struct dirty_throttle_control *dtc)
 
 	dtc->pos_ratio = pos_ratio;
 }
+EXPORT_SYMBOL_GPL(wb_position_ratio);
 
 static void wb_update_write_bandwidth(struct bdi_writeback *wb,
 				      unsigned long elapsed,
@@ -1439,7 +1458,7 @@ static void wb_update_dirty_ratelimit(struct dirty_throttle_control *dtc,
 	trace_bdi_dirty_ratelimit(wb, dirty_rate, task_ratelimit);
 }
 
-static void __wb_update_bandwidth(struct dirty_throttle_control *gdtc,
+void __wb_update_bandwidth(struct dirty_throttle_control *gdtc,
 				  struct dirty_throttle_control *mdtc,
 				  bool update_ratelimit)
 {
@@ -1481,6 +1500,7 @@ static void __wb_update_bandwidth(struct dirty_throttle_control *gdtc,
 	WRITE_ONCE(wb->bw_time_stamp, now);
 	spin_unlock(&wb->list_lock);
 }
+EXPORT_SYMBOL_GPL(__wb_update_bandwidth);
 
 void wb_update_bandwidth(struct bdi_writeback *wb)
 {
@@ -1515,7 +1535,7 @@ static void wb_bandwidth_estimate_start(struct bdi_writeback *wb)
  * global_zone_page_state() too often. So scale it near-sqrt to the safety margin
  * (the number of pages we may dirty without exceeding the dirty limits).
  */
-static unsigned long dirty_poll_interval(unsigned long dirty,
+unsigned long dirty_poll_interval(unsigned long dirty,
 					 unsigned long thresh)
 {
 	if (thresh > dirty)
@@ -1523,8 +1543,9 @@ static unsigned long dirty_poll_interval(unsigned long dirty,
 
 	return 1;
 }
+EXPORT_SYMBOL_GPL(dirty_poll_interval);
 
-static unsigned long wb_max_pause(struct bdi_writeback *wb,
+unsigned long wb_max_pause(struct bdi_writeback *wb,
 				  unsigned long wb_dirty)
 {
 	unsigned long bw = READ_ONCE(wb->avg_write_bandwidth);
@@ -1542,8 +1563,9 @@ static unsigned long wb_max_pause(struct bdi_writeback *wb,
 
 	return min_t(unsigned long, t, MAX_PAUSE);
 }
+EXPORT_SYMBOL_GPL(wb_max_pause);
 
-static long wb_min_pause(struct bdi_writeback *wb,
+long wb_min_pause(struct bdi_writeback *wb,
 			 long max_pause,
 			 unsigned long task_ratelimit,
 			 unsigned long dirty_ratelimit,
@@ -1617,8 +1639,9 @@ static long wb_min_pause(struct bdi_writeback *wb,
 	 */
 	return pages >= DIRTY_POLL_THRESH ? 1 + t / 2 : t;
 }
+EXPORT_SYMBOL_GPL(wb_min_pause);
 
-static inline void wb_dirty_limits(struct dirty_throttle_control *dtc)
+inline void wb_dirty_limits(struct dirty_throttle_control *dtc)
 {
 	struct bdi_writeback *wb = dtc->wb;
 	unsigned long wb_reclaimable;
@@ -1658,6 +1681,7 @@ static inline void wb_dirty_limits(struct dirty_throttle_control *dtc)
 		dtc->wb_dirty = wb_reclaimable + wb_stat(wb, WB_WRITEBACK);
 	}
 }
+EXPORT_SYMBOL_GPL(wb_dirty_limits);
 
 /*
  * balance_dirty_pages() must be called by processes which are generating dirty
@@ -1666,9 +1690,17 @@ static inline void wb_dirty_limits(struct dirty_throttle_control *dtc)
  * If we're over `background_thresh' then the writeback threads are woken to
  * perform some writeout.
  */
+
+int (*balance_dirty_pages_module)(struct bdi_writeback *wb,
+		unsigned long pages_dirtied, unsigned int flags);
+EXPORT_SYMBOL_GPL(balance_dirty_pages_module);
+
 static int balance_dirty_pages(struct bdi_writeback *wb,
 			       unsigned long pages_dirtied, unsigned int flags)
 {
+	if (balance_dirty_pages_module)
+		return (*balance_dirty_pages_module)(wb, pages_dirtied, flags);
+
 	struct dirty_throttle_control gdtc_stor = { GDTC_INIT(wb) };
 	struct dirty_throttle_control mdtc_stor = { MDTC_INIT(wb, &gdtc_stor) };
 	struct dirty_throttle_control * const gdtc = &gdtc_stor;
@@ -1954,7 +1986,8 @@ pause:
 	return ret;
 }
 
-static DEFINE_PER_CPU(int, bdp_ratelimits);
+DEFINE_PER_CPU(int, bdp_ratelimits);
+EXPORT_SYMBOL_GPL(bdp_ratelimits);
 
 /*
  * Normal tasks are throttled by
@@ -3200,3 +3233,7 @@ void folio_wait_stable(struct folio *folio)
 		folio_wait_writeback(folio);
 }
 EXPORT_SYMBOL_GPL(folio_wait_stable);
+
+EXPORT_SYMBOL_GPL(__SCK__tp_func_balance_dirty_pages);
+EXPORT_SYMBOL_GPL(__SCT__tp_func_balance_dirty_pages);
+EXPORT_SYMBOL_GPL(__tracepoint_balance_dirty_pages);

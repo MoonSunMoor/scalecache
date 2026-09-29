@@ -47,11 +47,13 @@ int fprop_global_init(struct fprop_global *p, gfp_t gfp)
 	seqcount_init(&p->sequence);
 	return 0;
 }
+EXPORT_SYMBOL(fprop_global_init);
 
 void fprop_global_destroy(struct fprop_global *p)
 {
 	percpu_counter_destroy(&p->events);
 }
+EXPORT_SYMBOL(fprop_global_destroy);
 
 /*
  * Declare @periods new periods. It is upto the caller to make sure period
@@ -82,6 +84,7 @@ bool fprop_new_period(struct fprop_global *p, int periods)
 
 	return true;
 }
+EXPORT_SYMBOL(fprop_new_period);
 
 /*
  * ---- SINGLE ----
@@ -248,6 +251,7 @@ void fprop_fraction_percpu(struct fprop_global *p,
 	*denominator = den;
 	*numerator = num;
 }
+EXPORT_SYMBOL(fprop_fraction_percpu);
 
 /*
  * Like __fprop_add_percpu() except that event is counted only if the given
