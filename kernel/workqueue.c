@@ -6214,6 +6214,7 @@ bool current_is_workqueue_rescuer(void)
 
 	return worker && worker->rescue_wq;
 }
+EXPORT_SYMBOL(current_is_workqueue_rescuer);
 
 /**
  * workqueue_congested - test whether a workqueue is congested

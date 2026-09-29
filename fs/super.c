@@ -573,6 +573,7 @@ bool super_trylock_shared(struct super_block *sb)
 
 	return false;
 }
+EXPORT_SYMBOL_GPL(super_trylock_shared);
 
 /**
  *	retire_super	-	prevents superblock from being reused

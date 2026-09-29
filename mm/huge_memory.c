@@ -2961,6 +2961,7 @@ spinlock_t *__pmd_trans_huge_lock(pmd_t *pmd, struct vm_area_struct *vma)
 	spin_unlock(ptl);
 	return NULL;
 }
+EXPORT_SYMBOL(__pmd_trans_huge_lock);
 
 /*
  * Returns page table lock pointer if a given pud maps a thp, NULL otherwise.
@@ -4259,6 +4260,7 @@ out_no_memcg:
 	count_mthp_stat(old_order, !ret ? MTHP_STAT_SPLIT : MTHP_STAT_SPLIT_FAILED);
 	return ret;
 }
+EXPORT_SYMBOL(split_huge_page_to_list);
 
 /**
  * folio_split_unmapped() - split a large anon folio that is already unmapped

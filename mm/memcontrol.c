@@ -3178,6 +3178,7 @@ void __memcg_kmem_uncharge_page(struct page *page, int order)
 	page->memcg_data = 0;
 	obj_cgroup_put(objcg);
 }
+EXPORT_SYMBOL_GPL(__memcg_kmem_uncharge_page);
 
 static struct obj_stock_pcp *trylock_stock(void)
 {
@@ -3576,6 +3577,12 @@ bool __memcg_slab_post_alloc_hook(struct kmem_cache *s, struct list_lru *lru,
 		return true;
 
 	flags &= gfp_allowed_mask;
+	if (folio_memcg_kmem(folio))
+		obj_cgroup_get_many(__folio_objcg(folio), nr - 1);
+	else
+		css_get_many(&memcg->css, nr - 1);
+}
+EXPORT_SYMBOL_GPL(split_page_memcg);
 
 	if (lru) {
 		int ret;

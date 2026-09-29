@@ -2476,6 +2476,7 @@ bool compaction_suitable(struct zone *zone, int order, unsigned long watermark,
 
 	return suitable;
 }
+EXPORT_SYMBOL(compaction_suitable);
 
 /* Used by direct reclaimers */
 bool compaction_zonelist_suitable(struct alloc_context *ac, int order,

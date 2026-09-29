@@ -924,6 +924,7 @@ int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index)
 	WARN_ON_ONCE(!ret);
 	return ret;
 }
+EXPORT_SYMBOL(dax_delete_mapping_entry);
 
 void dax_delete_mapping_range(struct address_space *mapping,
 				loff_t start, loff_t end)
@@ -1034,6 +1035,7 @@ int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
 {
 	return __dax_invalidate_entry(mapping, index, false);
 }
+EXPORT_SYMBOL(dax_invalidate_mapping_entry_sync);
 
 static pgoff_t dax_iomap_pgoff(const struct iomap *iomap, loff_t pos)
 {

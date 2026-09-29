@@ -41,6 +41,9 @@
 DEFINE_STATIC_KEY_FALSE(cpusets_pre_enable_key);
 DEFINE_STATIC_KEY_FALSE(cpusets_enabled_key);
 
+EXPORT_SYMBOL(cpusets_pre_enable_key);
+EXPORT_SYMBOL(cpusets_enabled_key);
+
 /*
  * There could be abnormal cpuset configurations for cpu or memory
  * node binding, add this key to provide a quick low-cost judgment
@@ -4194,6 +4197,7 @@ int cpuset_nodemask_valid_mems_allowed(nodemask_t *nodemask)
 {
 	return nodes_intersects(*nodemask, current->mems_allowed);
 }
+EXPORT_SYMBOL(cpuset_nodemask_valid_mems_allowed);
 
 /*
  * nearest_hardwall_ancestor() - Returns the nearest mem_exclusive or
@@ -4419,6 +4423,81 @@ void cpuset_print_current_mems_allowed(void)
 
 	rcu_read_unlock();
 }
+
+/*
+ * Collection of memory_pressure is suppressed unless
+ * this flag is enabled by writing "1" to the special
+ * cpuset file 'memory_pressure_enabled' in the root cpuset.
+ */
+
+int cpuset_memory_pressure_enabled __read_mostly;
+EXPORT_SYMBOL(cpuset_memory_pressure_enabled);
+
+/*
+ * __cpuset_memory_pressure_bump - keep stats of per-cpuset reclaims.
+ *
+ * Keep a running average of the rate of synchronous (direct)
+ * page reclaim efforts initiated by tasks in each cpuset.
+ *
+ * This represents the rate at which some task in the cpuset
+ * ran low on memory on all nodes it was allowed to use, and
+ * had to enter the kernels page reclaim code in an effort to
+ * create more free memory by tossing clean pages or swapping
+ * or writing dirty pages.
+ *
+ * Display to user space in the per-cpuset read-only file
+ * "memory_pressure".  Value displayed is an integer
+ * representing the recent rate of entry into the synchronous
+ * (direct) page reclaim by any task attached to the cpuset.
+ */
+
+void __cpuset_memory_pressure_bump(void)
+{
+	rcu_read_lock();
+	fmeter_markevent(&task_cs(current)->fmeter);
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL(__cpuset_memory_pressure_bump);
+
+#ifdef CONFIG_PROC_PID_CPUSET
+/*
+ * proc_cpuset_show()
+ *  - Print tasks cpuset path into seq_file.
+ *  - Used for /proc/<pid>/cpuset.
+ *  - No need to task_lock(tsk) on this tsk->cpuset reference, as it
+ *    doesn't really matter if tsk->cpuset changes after we read it,
+ *    and we take cpuset_mutex, keeping cpuset_attach() from changing it
+ *    anyway.
+ */
+int proc_cpuset_show(struct seq_file *m, struct pid_namespace *ns,
+		     struct pid *pid, struct task_struct *tsk)
+{
+	char *buf;
+	struct cgroup_subsys_state *css;
+	int retval;
+
+	retval = -ENOMEM;
+	buf = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!buf)
+		goto out;
+
+	css = task_get_css(tsk, cpuset_cgrp_id);
+	retval = cgroup_path_ns(css->cgroup, buf, PATH_MAX,
+				current->nsproxy->cgroup_ns);
+	css_put(css);
+	if (retval >= PATH_MAX)
+		retval = -ENAMETOOLONG;
+	if (retval < 0)
+		goto out_free;
+	seq_puts(m, buf);
+	seq_putc(m, '\n');
+	retval = 0;
+out_free:
+	kfree(buf);
+out:
+	return retval;
+}
+#endif /* CONFIG_PROC_PID_CPUSET */
 
 /* Display task mems_allowed in /proc/<pid>/status file. */
 void cpuset_task_status_allowed(struct seq_file *m, struct task_struct *task)
