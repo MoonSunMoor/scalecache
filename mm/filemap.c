@@ -472,6 +472,9 @@ int filemap_flush_nr(struct address_space *mapping, long *nr_to_write)
 }
 EXPORT_SYMBOL_FOR_MODULES(filemap_flush_nr, "btrfs");
 
+static bool cc_filemap_range_has_page(struct address_space *mapping,
+				      loff_t start_byte, loff_t end_byte);
+
 /**
  * filemap_range_has_page - check if a page exists in range.
  * @mapping:           address space within which to check
@@ -490,6 +493,9 @@ bool filemap_range_has_page(struct address_space *mapping,
 	struct folio *folio;
 	XA_STATE(xas, &mapping->i_pages, start_byte >> PAGE_SHIFT);
 	pgoff_t max = end_byte >> PAGE_SHIFT;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_filemap_range_has_page(mapping, start_byte, end_byte);
 
 	if (end_byte < start_byte)
 		return false;
@@ -514,6 +520,37 @@ bool filemap_range_has_page(struct address_space *mapping,
 	return folio != NULL;
 }
 EXPORT_SYMBOL(filemap_range_has_page);
+
+static bool cc_filemap_range_has_page(struct address_space *mapping,
+				      loff_t start_byte, loff_t end_byte)
+{
+	struct folio *folio;
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), start_byte >> PAGE_SHIFT);
+	pgoff_t max = end_byte >> PAGE_SHIFT;
+
+	if (end_byte < start_byte)
+		return false;
+
+	rcu_read_lock();
+	for (;;) {
+		folio = cc_xas_find(&xas, max);
+		if (cc_xas_retry(&xas, folio))
+			continue;
+		/* Shadow entries don't count */
+		if (cc_xa_is_value(folio))
+			continue;
+		/*
+		 * We don't need to try to pin this page; we're about to
+		 * release the RCU lock anyway.  It is enough to know that
+		 * there was a page here recently.
+		 */
+		break;
+	}
+	rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
+
+	return folio != NULL;
+}
 
 static void __filemap_fdatawait_range(struct address_space *mapping,
 				     loff_t start_byte, loff_t end_byte)
