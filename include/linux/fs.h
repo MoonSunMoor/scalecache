@@ -480,6 +480,10 @@ struct address_space {
 #endif
 	struct rb_root_cached	i_mmap;
 	unsigned long		nrpages;
+
+	unsigned long		nrexceptional;
+
+	spinlock_t		nr_lock;
 	pgoff_t			writeback_index;
 	const struct address_space_operations *a_ops;
 	unsigned long		flags;

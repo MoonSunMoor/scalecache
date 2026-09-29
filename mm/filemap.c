@@ -126,6 +126,8 @@
 static void page_cache_delete(struct address_space *mapping,
 				   struct folio *folio, void *shadow)
 {
+	unsigned long flags;
+
 	XA_STATE(xas, &mapping->i_pages, folio->index);
 	long nr = 1;
 
@@ -144,7 +146,9 @@ static void page_cache_delete(struct address_space *mapping,
 
 	folio->mapping = NULL;
 	/* Leave page->index set: truncation lookup relies upon it */
+	spin_lock_irqsave(&mapping->nr_lock, flags);
 	mapping->nrpages -= nr;
+	spin_unlock_irqrestore(&mapping->nr_lock, flags);
 }
 
 static void filemap_unaccount_folio(struct address_space *mapping,
@@ -283,11 +287,13 @@ static void page_cache_delete_batch(struct address_space *mapping,
 	long total_pages = 0;
 	int i = 0;
 	struct folio *folio;
+	unsigned long flags;
 
 	mapping_set_update(&xas, mapping);
 	xas_for_each(&xas, folio, ULONG_MAX) {
 		if (i >= folio_batch_count(fbatch))
 			break;
+
 
 		/* A swap/dax/shadow entry got inserted? Skip it. */
 		if (xa_is_value(folio))
@@ -314,7 +320,9 @@ static void page_cache_delete_batch(struct address_space *mapping,
 		xas_store(&xas, NULL);
 		total_pages += folio_nr_pages(folio);
 	}
+	spin_lock_irqsave(&mapping->nr_lock, flags);
 	mapping->nrpages -= total_pages;
+	spin_unlock_irqrestore(&mapping->nr_lock, flags);
 }
 
 void delete_from_page_cache_batch(struct address_space *mapping,
@@ -625,7 +633,12 @@ EXPORT_SYMBOL(filemap_fdatawait_keep_errors);
 /* Returns true if writeback might be needed or already in progress. */
 static bool mapping_needs_writeback(struct address_space *mapping)
 {
-	return mapping->nrpages;
+	unsigned long flags, nrpages;
+
+	spin_lock_irqsave(&mapping->nr_lock, flags);
+	nrpages = mapping->nrpages;
+	spin_unlock_irqrestore(&mapping->nr_lock, flags);
+	return nrpages;
 }
 
 bool filemap_range_has_writeback(struct address_space *mapping,
@@ -848,6 +861,7 @@ noinline int __filemap_add_folio(struct address_space *mapping,
 	int huge = folio_test_hugetlb(folio);
 	bool charged = false;
 	long nr = 1;
+	unsigned long flags;
 
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
 	VM_BUG_ON_FOLIO(folio_test_swapbacked(folio), folio);
@@ -901,7 +915,9 @@ noinline int __filemap_add_folio(struct address_space *mapping,
 		if (xas_error(&xas))
 			goto unlock;
 
+		spin_lock_irqsave(&mapping->nr_lock, flags);
 		mapping->nrpages += nr;
+		spin_unlock_irqrestore(&mapping->nr_lock, flags);
 
 		/* hugetlb pages do not participate in page cache accounting */
 		if (!huge) {
@@ -1864,6 +1880,7 @@ struct folio *__filemap_get_folio(struct address_space *mapping, pgoff_t index,
 		fgf_t fgp_flags, gfp_t gfp)
 {
 	struct folio *folio;
+	unsigned long flags;
 
 repeat:
 	folio = filemap_get_entry(mapping, index);

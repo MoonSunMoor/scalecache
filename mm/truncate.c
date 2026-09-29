@@ -467,6 +467,8 @@ void truncate_inode_pages_final(struct address_space *mapping)
 	 * so that it does not install eviction information after the
 	 * final truncate has begun.
 	 */
+	unsigned long flags;
+
 	mapping_set_exiting(mapping);
 
 	if (!mapping_empty(mapping)) {
@@ -477,6 +479,8 @@ void truncate_inode_pages_final(struct address_space *mapping)
 		 * completed before starting the final truncate.
 		 */
 		xa_lock_irq(&mapping->i_pages);
+		spin_lock_irqsave(&mapping->nr_lock, flags);
+		spin_unlock_irqrestore(&mapping->nr_lock, flags);
 		xa_unlock_irq(&mapping->i_pages);
 	}
 
