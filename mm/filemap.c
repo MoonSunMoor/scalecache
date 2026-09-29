@@ -123,6 +123,9 @@
  *    ->private_lock		(zap_pte_range->block_dirty_folio)
  */
 
+static void cc_page_cache_delete(struct address_space *mapping,
+				   struct folio *folio, void *shadow);
+
 static void page_cache_delete(struct address_space *mapping,
 				   struct folio *folio, void *shadow)
 {
@@ -130,6 +133,9 @@ static void page_cache_delete(struct address_space *mapping,
 
 	XA_STATE(xas, &mapping->i_pages, folio->index);
 	long nr = 1;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_page_cache_delete(mapping, folio, shadow);
 
 	mapping_set_update(&xas, mapping);
 
@@ -143,6 +149,34 @@ static void page_cache_delete(struct address_space *mapping,
 
 	xas_store(&xas, shadow);
 	xas_init_marks(&xas);
+
+	folio->mapping = NULL;
+	/* Leave page->index set: truncation lookup relies upon it */
+	spin_lock_irqsave(&mapping->nr_lock, flags);
+	mapping->nrpages -= nr;
+	spin_unlock_irqrestore(&mapping->nr_lock, flags);
+}
+
+static void cc_page_cache_delete(struct address_space *mapping,
+				   struct folio *folio, void *shadow)
+{
+	unsigned long flags;
+
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), folio->index);
+	long nr = 1;
+
+	cc_mapping_set_update(&xas, mapping);
+
+	/* hugetlb pages are represented by a single entry in the xarray */
+	if (!folio_test_hugetlb(folio)) {
+		cc_xas_set_order(&xas, folio->index, folio_order(folio));
+		nr = folio_nr_pages(folio);
+	}
+
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+
+	cc_xas_store(&xas, shadow);
+	cc_xas_init_marks(&xas);
 
 	folio->mapping = NULL;
 	/* Leave page->index set: truncation lookup relies upon it */
@@ -280,6 +314,9 @@ void filemap_remove_folio(struct folio *folio)
  *
  * The function expects the i_pages lock to be held.
  */
+static void cc_page_cache_delete_batch(struct address_space *mapping,
+			     struct folio_batch *fbatch);
+
 static void page_cache_delete_batch(struct address_space *mapping,
 			     struct folio_batch *fbatch)
 {
@@ -320,6 +357,53 @@ static void page_cache_delete_batch(struct address_space *mapping,
 		xas_store(&xas, NULL);
 		total_pages += folio_nr_pages(folio);
 	}
+	spin_lock_irqsave(&mapping->nr_lock, flags);
+	mapping->nrpages -= total_pages;
+	spin_unlock_irqrestore(&mapping->nr_lock, flags);
+}
+
+static void cc_page_cache_delete_batch(struct address_space *mapping,
+			     struct folio_batch *fbatch)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), fbatch->folios[0]->index);
+	long total_pages = 0;
+	int i = 0;
+	struct folio *folio;
+	unsigned long flags;
+
+	cc_mapping_set_update(&xas, mapping);
+	cc_xas_for_each(&xas, folio, ULONG_MAX) {
+		if (i >= folio_batch_count(fbatch))
+			break;
+
+
+		/* A swap/dax/shadow entry got inserted? Skip it. */
+		if (xa_is_value(folio))
+			continue;
+		/*
+		 * A page got inserted in our range? Skip it. We have our
+		 * pages locked so they are protected from being removed.
+		 * If we see a page whose index is higher than ours, it
+		 * means our page has been removed, which shouldn't be
+		 * possible because we're holding the PageLock.
+		 */
+		if (folio != fbatch->folios[i]) {
+			VM_BUG_ON_FOLIO(folio->index >
+					fbatch->folios[i]->index, folio);
+			continue;
+		}
+
+		WARN_ON_ONCE(!folio_test_locked(folio));
+
+		folio->mapping = NULL;
+		/* Leave folio->index set: truncation lookup relies on it */
+
+		i++;
+		cc_xas_store(&xas, NULL);
+		total_pages += folio_nr_pages(folio);
+	}
+	cc_xas_clear_xa_node(&xas);
+
 	spin_lock_irqsave(&mapping->nr_lock, flags);
 	mapping->nrpages -= total_pages;
 	spin_unlock_irqrestore(&mapping->nr_lock, flags);
