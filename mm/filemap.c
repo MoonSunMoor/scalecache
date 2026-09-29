@@ -4845,6 +4845,9 @@ out:
 EXPORT_SYMBOL_GPL(filemap_invalidate_inode);
 
 #ifdef CONFIG_CACHESTAT_SYSCALL
+static void cc_filemap_cachestat(struct address_space *mapping,
+		pgoff_t first_index, pgoff_t last_index, struct cachestat *cs);
+
 /**
  * filemap_cachestat() - compute the page cache statistics of a mapping
  * @mapping:	The mapping to compute the statistics for.
@@ -4862,6 +4865,11 @@ static void filemap_cachestat(struct address_space *mapping,
 {
 	XA_STATE(xas, &mapping->i_pages, first_index);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas)) {
+		filemap_cachestat(mapping, first_index, last_index, cs);
+		return;
+	}
 
 	/* Flush stats (and potentially sleep) outside the RCU read section. */
 	mem_cgroup_flush_stats_ratelimited(NULL);
@@ -4951,6 +4959,103 @@ resched:
 		}
 	}
 	rcu_read_unlock();
+}
+
+static void cc_filemap_cachestat(struct address_space *mapping,
+		pgoff_t first_index, pgoff_t last_index, struct cachestat *cs)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), first_index);
+	struct folio *folio;
+
+	/* Flush stats (and potentially sleep) outside the RCU read section. */
+	mem_cgroup_flush_stats_ratelimited(NULL);
+
+	//rcu_read_lock();
+	cc_xas_for_each(&xas, folio, last_index) {
+		int order;
+		unsigned long nr_pages;
+		pgoff_t folio_first_index, folio_last_index;
+
+		/*
+		 * Don't deref the folio. It is not pinned, and might
+		 * get freed (and reused) underneath us.
+		 *
+		 * We *could* pin it, but that would be expensive for
+		 * what should be a fast and lightweight syscall.
+		 *
+		 * Instead, derive all information of interest from
+		 * the rcu-protected xarray.
+		 */
+
+		if (cc_xas_retry(&xas, folio))
+			continue;
+
+		order = cc_xas_get_order(&xas);
+		nr_pages = 1 << order;
+		folio_first_index = round_down(xas.xa_index, 1 << order);
+		folio_last_index = folio_first_index + nr_pages - 1;
+
+		/* Folios might straddle the range boundaries, only count covered pages */
+		if (folio_first_index < first_index)
+			nr_pages -= first_index - folio_first_index;
+
+		if (folio_last_index > last_index)
+			nr_pages -= folio_last_index - last_index;
+
+		if (cc_xa_is_value(folio)) {
+			/* page is evicted */
+			void *shadow = (void *)folio;
+			bool workingset; /* not used */
+
+			cs->nr_evicted += nr_pages;
+
+#ifdef CONFIG_SWAP /* implies CONFIG_MMU */
+			if (shmem_mapping(mapping)) {
+				/* shmem file - in swap cache */
+				swp_entry_t swp = radix_to_swp_entry(folio);
+
+				/* swapin error results in poisoned entry */
+				if (!softleaf_is_swap(swp))
+					goto resched;
+
+				/*
+				 * Getting a swap entry from the shmem
+				 * inode means we beat
+				 * shmem_unuse(). rcu_read_lock()
+				 * ensures swapoff waits for us before
+				 * freeing the swapper space. However,
+				 * we can race with swapping and
+				 * invalidation, so there might not be
+				 * a shadow in the swapcache (yet).
+				 */
+				shadow = swap_cache_get_shadow(swp);
+				if (!shadow)
+					goto resched;
+			}
+#endif
+			if (workingset_test_recent(shadow, true, &workingset, false))
+				cs->nr_recently_evicted += nr_pages;
+
+			goto resched;
+		}
+
+		/* page is in cache */
+		cs->nr_cache += nr_pages;
+
+		if (cc_xas_get_mark(&xas, PAGECACHE_TAG_DIRTY))
+			cs->nr_dirty += nr_pages;
+
+		if (cc_xas_get_mark(&xas, PAGECACHE_TAG_WRITEBACK))
+			cs->nr_writeback += nr_pages;
+
+resched:
+		if (need_resched()) {
+			cc_xas_pause(&xas);
+			cond_resched_rcu();
+		}
+	}
+	//rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
 }
 
 /*
