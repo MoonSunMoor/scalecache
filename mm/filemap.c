@@ -1744,10 +1744,16 @@ vm_fault_t __folio_lock_or_retry(struct folio *folio, struct vm_fault *vmf)
  * range specified (in which case 'return - index >= max_scan' will be true).
  * In the rare case of index wrap-around, 0 will be returned.
  */
+pgoff_t cc_page_cache_next_miss(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan);
+
 pgoff_t page_cache_next_miss(struct address_space *mapping,
 			     pgoff_t index, unsigned long max_scan)
 {
 	XA_STATE(xas, &mapping->i_pages, index);
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_page_cache_next_miss(mapping, index, max_scan);
 
 	while (max_scan--) {
 		void *entry = xas_next(&xas);
@@ -1760,6 +1766,25 @@ pgoff_t page_cache_next_miss(struct address_space *mapping,
 	return xas.xa_index;
 }
 EXPORT_SYMBOL(page_cache_next_miss);
+
+pgoff_t cc_page_cache_next_miss(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+
+	while (max_scan--) {
+		void *entry = cc_xas_next(&xas);
+		if (!entry || cc_xa_is_value(entry))
+			break;
+		if (xas.xa_index == 0)
+			break;
+	}
+
+	cc_xas_clear_xa_node(&xas);
+
+	return xas.xa_index;
+}
+EXPORT_SYMBOL(cc_page_cache_next_miss);
 
 /**
  * page_cache_prev_miss() - Find the previous gap in the page cache.
@@ -1780,10 +1805,15 @@ EXPORT_SYMBOL(page_cache_next_miss);
  * range specified (in which case 'index - return >= max_scan' will be true).
  * In the rare case of wrap-around, ULONG_MAX will be returned.
  */
+pgoff_t cc_page_cache_prev_miss(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan);
 pgoff_t page_cache_prev_miss(struct address_space *mapping,
 			     pgoff_t index, unsigned long max_scan)
 {
 	XA_STATE(xas, &mapping->i_pages, index);
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_page_cache_prev_miss(mapping, index, max_scan);
 
 	while (max_scan--) {
 		void *entry = xas_prev(&xas);
@@ -1796,6 +1826,25 @@ pgoff_t page_cache_prev_miss(struct address_space *mapping,
 	return xas.xa_index;
 }
 EXPORT_SYMBOL(page_cache_prev_miss);
+
+pgoff_t cc_page_cache_prev_miss(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+
+	while (max_scan--) {
+		void *entry = cc_xas_prev(&xas);
+		if (!entry || cc_xa_is_value(entry))
+			break;
+		if (xas.xa_index == ULONG_MAX)
+			break;
+	}
+
+	cc_xas_clear_xa_node(&xas);
+
+	return xas.xa_index;
+}
+EXPORT_SYMBOL(cc_page_cache_prev_miss);
 
 /*
  * Lockless page cache protocol:
@@ -1829,10 +1878,15 @@ EXPORT_SYMBOL(page_cache_prev_miss);
  *
  * Return: The folio, swap or shadow entry, %NULL if nothing is found.
  */
+
+void *cc_filemap_get_entry(struct address_space *mapping, pgoff_t index);
 void *filemap_get_entry(struct address_space *mapping, pgoff_t index)
 {
 	XA_STATE(xas, &mapping->i_pages, index);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_filemap_get_entry(mapping, index);
 
 	rcu_read_lock();
 repeat:
@@ -1856,6 +1910,38 @@ repeat:
 	}
 out:
 	rcu_read_unlock();
+
+	return folio;
+}
+
+void *cc_filemap_get_entry(struct address_space *mapping, pgoff_t index)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+	struct folio *folio;
+
+	// rcu_read_lock();
+repeat:
+	cc_xas_reset(&xas);
+	folio = cc_xas_load(&xas, true);
+	if (cc_xas_retry(&xas, folio))
+		goto repeat;
+	/*
+	 * A shadow entry of a recently evicted page, or a swap entry from
+	 * shmem/tmpfs.  Return it without attempting to raise page count.
+	 */
+	if (!folio || cc_xa_is_value(folio))
+		goto out;
+
+	if (!folio_try_get_rcu(folio))
+		goto repeat;
+
+	if (unlikely(folio != cc_xas_reload(&xas))) {
+		folio_put(folio);
+		goto repeat;
+	}
+out:
+	//rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
 
 	return folio;
 }
@@ -1982,6 +2068,113 @@ no_page:
 	return folio;
 }
 EXPORT_SYMBOL(__filemap_get_folio);
+
+struct folio *__cc_filemap_get_folio(struct address_space *mapping, pgoff_t index,
+		fgf_t fgp_flags, gfp_t gfp)
+{
+	struct folio *folio;
+	unsigned long flags;
+
+repeat:
+	folio = cc_filemap_get_entry(mapping, index);
+	if (cc_xa_is_value(folio))
+		folio = NULL;
+	if (!folio)
+		goto no_page;
+
+	if (fgp_flags & FGP_LOCK) {
+		if (fgp_flags & FGP_NOWAIT) {
+			if (!folio_trylock(folio)) {
+				folio_put(folio);
+				return ERR_PTR(-EAGAIN);
+			}
+		} else {
+			folio_lock(folio);
+		}
+
+		/* Has the page been truncated? */
+		if (unlikely(folio->mapping != mapping)) {
+			folio_unlock(folio);
+			folio_put(folio);
+			goto repeat;
+		}
+		VM_BUG_ON_FOLIO(!folio_contains(folio, index), folio);
+	}
+
+	if (fgp_flags & FGP_ACCESSED)
+		folio_mark_accessed(folio);
+	else if (fgp_flags & FGP_WRITE) {
+		/* Clear idle flag for buffer write */
+		if (folio_test_idle(folio))
+			folio_clear_idle(folio);
+	}
+
+	if (fgp_flags & FGP_STABLE)
+		folio_wait_stable(folio);
+no_page:
+	if (!folio && (fgp_flags & FGP_CREAT)) {
+		unsigned order = FGF_GET_ORDER(fgp_flags);
+		int err;
+
+		if ((fgp_flags & FGP_WRITE) && mapping_can_writeback(mapping))
+			gfp |= __GFP_WRITE;
+		if (fgp_flags & FGP_NOFS)
+			gfp &= ~__GFP_FS;
+		if (fgp_flags & FGP_NOWAIT) {
+			gfp &= ~GFP_KERNEL;
+			gfp |= GFP_NOWAIT | __GFP_NOWARN;
+		}
+		if (WARN_ON_ONCE(!(fgp_flags & (FGP_LOCK | FGP_FOR_MMAP))))
+			fgp_flags |= FGP_LOCK;
+
+		if (!mapping_large_folio_support(mapping))
+			order = 0;
+		if (order > MAX_PAGECACHE_ORDER)
+			order = MAX_PAGECACHE_ORDER;
+		/* If we're not aligned, allocate a smaller folio */
+		if (index & ((1UL << order) - 1))
+			order = __ffs(index);
+
+		do {
+			gfp_t alloc_gfp = gfp;
+
+			err = -ENOMEM;
+			if (order == 1)
+				order = 0;
+			if (order > 0)
+				alloc_gfp |= __GFP_NORETRY | __GFP_NOWARN;
+			folio = filemap_alloc_folio(alloc_gfp, order);
+			if (!folio)
+				continue;
+
+			/* Init accessed so avoid atomic mark_page_accessed later */
+			if (fgp_flags & FGP_ACCESSED)
+				__folio_set_referenced(folio);
+
+			err = filemap_add_folio(mapping, folio, index, gfp);
+			if (!err)
+				break;
+			folio_put(folio);
+			folio = NULL;
+		} while (order-- > 0);
+
+		if (err == -EEXIST)
+			goto repeat;
+		if (err)
+			return ERR_PTR(err);
+		/*
+		 * filemap_add_folio locks the page, and for mmap
+		 * we expect an unlocked page.
+		 */
+		if (folio && (fgp_flags & FGP_FOR_MMAP))
+			folio_unlock(folio);
+	}
+
+	if (!folio)
+		return ERR_PTR(-ENOENT);
+	return folio;
+}
+EXPORT_SYMBOL(__cc_filemap_get_folio);
 
 static inline struct folio *find_get_entry(struct xa_state *xas, pgoff_t max,
 		xa_mark_t mark)
