@@ -3466,10 +3466,16 @@ out:
 }
 EXPORT_SYMBOL(filemap_splice_read);
 
+static inline loff_t cc_folio_seek_hole_data(struct cc_xa_state *xas,
+		struct address_space *mapping, struct folio *folio,
+		loff_t start, loff_t end, bool seek_data);
 static inline loff_t folio_seek_hole_data(struct xa_state *xas,
 		struct address_space *mapping, struct folio *folio,
 		loff_t start, loff_t end, bool seek_data)
 {
+	if (cc_xas_is_ccxarray(xas))
+		printk(KERN_ERR "[%s] need to check (%pS) \n", __func__, __builtin_return_address(0));
+
 	const struct address_space_operations *ops = mapping->a_ops;
 	size_t offset, bsz = i_blocksize(mapping->host);
 
@@ -3499,10 +3505,53 @@ unlock:
 	return start;
 }
 
+static inline loff_t cc_folio_seek_hole_data(struct cc_xa_state *xas,
+		struct address_space *mapping, struct folio *folio,
+		loff_t start, loff_t end, bool seek_data)
+{
+	const struct address_space_operations *ops = mapping->a_ops;
+	size_t offset, bsz = i_blocksize(mapping->host);
+
+	if (cc_xa_is_value(folio) || folio_test_uptodate(folio))
+		return seek_data ? start : end;
+	if (!ops->is_partially_uptodate)
+		return seek_data ? end : start;
+
+	cc_xas_pause(xas);
+	rcu_read_unlock();
+	folio_lock(folio);
+	if (unlikely(folio->mapping != mapping))
+		goto unlock;
+
+	offset = offset_in_folio(folio, start) & ~(bsz - 1);
+
+	do {
+		if (ops->is_partially_uptodate(folio, offset, bsz) ==
+							seek_data)
+			break;
+		start = (start + bsz) & ~(bsz - 1);
+		offset += bsz;
+	} while (offset < folio_size(folio));
+unlock:
+	folio_unlock(folio);
+	rcu_read_lock();
+	return start;
+}
+
+static inline size_t cc_seek_folio_size(struct cc_xa_state *xas, struct folio *folio);
 static inline size_t seek_folio_size(struct xa_state *xas, struct folio *folio)
 {
+	if (cc_xas_is_ccxarray(xas))
+		printk(KERN_ERR "[%s] need to check (%pS) \n", __func__, __builtin_return_address(0));
+
 	if (xa_is_value(folio))
 		return PAGE_SIZE << xa_get_order(xas->xa, xas->xa_index);
+	return folio_size(folio);
+}
+static inline size_t cc_seek_folio_size(struct cc_xa_state *xas, struct folio *folio)
+{	
+	if (xa_is_value(folio))
+		return PAGE_SIZE << cc_xa_get_order(xas->xa, xas->xa_index);
 	return folio_size(folio);
 }
 
@@ -3524,6 +3573,8 @@ static inline size_t seek_folio_size(struct xa_state *xas, struct folio *folio)
  * after @end - 1, so SEEK_HOLE returns @end if all the bytes between @start
  * and @end contain data.
  */
+loff_t cc_mapping_seek_hole_data(struct address_space *mapping, loff_t start,
+		loff_t end, int whence);
 loff_t mapping_seek_hole_data(struct address_space *mapping, loff_t start,
 		loff_t end, int whence)
 {
@@ -3531,6 +3582,9 @@ loff_t mapping_seek_hole_data(struct address_space *mapping, loff_t start,
 	pgoff_t max = (end - 1) >> PAGE_SHIFT;
 	bool seek_data = (whence == SEEK_DATA);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_mapping_seek_hole_data(mapping, start, end, whence);
 
 	if (end <= start)
 		return -ENXIO;
@@ -3564,6 +3618,53 @@ loff_t mapping_seek_hole_data(struct address_space *mapping, loff_t start,
 unlock:
 	rcu_read_unlock();
 	if (folio && !xa_is_value(folio))
+		folio_put(folio);
+	if (start > end)
+		return end;
+	return start;
+}
+
+loff_t cc_mapping_seek_hole_data(struct address_space *mapping, loff_t start,
+		loff_t end, int whence)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), start >> PAGE_SHIFT);
+	pgoff_t max = (end - 1) >> PAGE_SHIFT;
+	bool seek_data = (whence == SEEK_DATA);
+	struct folio *folio;
+
+	if (end <= start)
+		return -ENXIO;
+
+	// rcu_read_lock();
+	while ((folio = cc_find_get_entry(&xas, max, CC_XA_PRESENT))) {
+		loff_t pos = (u64)xas.xa_index << PAGE_SHIFT;
+		size_t seek_size;
+
+		if (start < pos) {
+			if (!seek_data)
+				goto unlock;
+			start = pos;
+		}
+
+		seek_size = cc_seek_folio_size(&xas, folio);
+		pos = round_up((u64)pos + 1, seek_size);
+		start = cc_folio_seek_hole_data(&xas, mapping, folio, start, pos,
+				seek_data);
+		if (start < pos)
+			goto unlock;
+		if (start >= end)
+			break;
+		if (seek_size > PAGE_SIZE)
+			cc_xas_set(&xas, pos >> PAGE_SHIFT);
+		if (!xa_is_value(folio))
+			folio_put(folio);
+	}
+	if (seek_data)
+		start = -ENXIO;
+unlock:
+	//rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
+	if (folio && !cc_xa_is_value(folio))
 		folio_put(folio);
 	if (start > end)
 		return end;
