@@ -1806,6 +1806,9 @@ vm_fault_t __folio_lock_or_retry(struct folio *folio, struct vm_fault *vmf)
 	return 0;
 }
 
+static pgoff_t cc_page_cache_next_miss(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan);
+
 /**
  * page_cache_next_miss() - Find the next gap in the page cache.
  * @mapping: Mapping.
@@ -1830,6 +1833,9 @@ pgoff_t page_cache_next_miss(struct address_space *mapping,
 {
 	XA_STATE(xas, &mapping->i_pages, index);
 
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_page_cache_next_miss(mapping, index, max_scan);
+
 	while (max_scan--) {
 		void *entry = xas_next(&xas);
 		if (!entry || xa_is_value(entry))
@@ -1842,6 +1848,34 @@ pgoff_t page_cache_next_miss(struct address_space *mapping,
 	return xas.xa_index + 1;
 }
 EXPORT_SYMBOL(page_cache_next_miss);
+
+static pgoff_t cc_page_cache_next_miss(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+	pgoff_t ret;
+
+	while (max_scan--) {
+		void *entry = cc_xas_next(&xas);
+		if (!entry || cc_xa_is_value(entry)) {
+			ret = xas.xa_index;
+			goto out;
+		}
+		if (xas.xa_index == 0) {
+			ret = 0;
+			goto out;
+		}
+	}
+
+	/* Return end of the range + 1 when no hole is found */
+	ret = xas.xa_index + 1;
+out:
+	cc_xas_clear_xa_node(&xas);
+	return ret;
+}
+
+static pgoff_t cc_page_cache_prev_miss(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan);
 
 /**
  * page_cache_prev_miss() - Find the previous gap in the page cache.
@@ -1867,6 +1901,9 @@ pgoff_t page_cache_prev_miss(struct address_space *mapping,
 {
 	XA_STATE(xas, &mapping->i_pages, index);
 
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_page_cache_prev_miss(mapping, index, max_scan);
+
 	while (max_scan--) {
 		void *entry = xas_prev(&xas);
 		if (!entry || xa_is_value(entry))
@@ -1879,6 +1916,31 @@ pgoff_t page_cache_prev_miss(struct address_space *mapping,
 	return xas.xa_index - 1;
 }
 EXPORT_SYMBOL(page_cache_prev_miss);
+
+static pgoff_t cc_page_cache_prev_miss(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+	pgoff_t ret;
+
+	while (max_scan--) {
+		void *entry = cc_xas_prev(&xas);
+		if (!entry || cc_xa_is_value(entry)) {
+			ret = xas.xa_index;
+			goto out;
+		}
+		if (xas.xa_index == ULONG_MAX) {
+			ret = ULONG_MAX;
+			goto out;
+		}
+	}
+
+	/* Return start of the range - 1 when no hole is found */
+	ret = xas.xa_index - 1;
+out:
+	cc_xas_clear_xa_node(&xas);
+	return ret;
+}
 
 /*
  * Lockless page cache protocol:
@@ -1900,6 +1962,8 @@ EXPORT_SYMBOL(page_cache_prev_miss);
  * folio_put().
  */
 
+static void *cc_filemap_get_entry(struct address_space *mapping, pgoff_t index);
+
 /*
  * filemap_get_entry - Get a page cache entry.
  * @mapping: the address_space to search
@@ -1916,6 +1980,9 @@ void *filemap_get_entry(struct address_space *mapping, pgoff_t index)
 {
 	XA_STATE(xas, &mapping->i_pages, index);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_filemap_get_entry(mapping, index);
 
 	rcu_read_lock();
 repeat:
@@ -1939,6 +2006,38 @@ repeat:
 	}
 out:
 	rcu_read_unlock();
+
+	return folio;
+}
+
+static void *cc_filemap_get_entry(struct address_space *mapping, pgoff_t index)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+	struct folio *folio;
+
+	// rcu_read_lock();
+repeat:
+	cc_xas_reset(&xas);
+	folio = cc_xas_load(&xas, true);
+	if (cc_xas_retry(&xas, folio))
+		goto repeat;
+	/*
+	 * A shadow entry of a recently evicted page, or a swap entry from
+	 * shmem/tmpfs.  Return it without attempting to raise page count.
+	 */
+	if (!folio || cc_xa_is_value(folio))
+		goto out;
+
+	if (!folio_try_get(folio))
+		goto repeat;
+
+	if (unlikely(folio != cc_xas_reload(&xas))) {
+		folio_put(folio);
+		goto repeat;
+	}
+out:
+	//rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
 
 	return folio;
 }
