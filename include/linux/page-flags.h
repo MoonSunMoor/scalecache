@@ -755,6 +755,7 @@ CLEARPAGEFLAG(Uptodate, uptodate, PF_NO_TAIL)
 
 bool __folio_start_writeback(struct folio *folio, bool keep_write);
 bool set_page_writeback(struct page *page);
+bool cc_set_page_writeback(struct page *page);
 
 #define folio_start_writeback(folio)			\
 	__folio_start_writeback(folio, false)
@@ -765,6 +766,11 @@ static inline bool test_set_page_writeback(struct page *page)
 {
 	return set_page_writeback(page);
 }
+static inline bool cc_test_set_page_writeback(struct page *page)
+{
+	return cc_set_page_writeback(page);
+}
+
 
 static __always_inline bool folio_test_head(struct folio *folio)
 {
