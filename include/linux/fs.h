@@ -14,6 +14,7 @@
 #include <linux/llist.h>
 #include <linux/radix-tree.h>
 #include <linux/xarray.h>
+#include <linux/cc_xarray.h> // seokjoo
 #include <linux/rbtree.h>
 #include <linux/init.h>
 #include <linux/pid.h>
