@@ -912,6 +912,7 @@ void lru_add_drain_all(void)
 #endif /* CONFIG_SMP */
 
 atomic_t lru_disable_count = ATOMIC_INIT(0);
+EXPORT_SYMBOL(lru_disable_count);
 
 /*
  * lru_cache_disable() needs to be called before we start compiling
