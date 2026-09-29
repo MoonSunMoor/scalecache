@@ -564,6 +564,9 @@ unlock:
 }
 #endif
 
+static int __cc_folio_migrate_mapping(struct address_space *mapping,
+		struct folio *newfolio, struct folio *folio, int expected_count);
+
 /*
  * Replace the folio in the mapping.
  *
@@ -602,6 +605,10 @@ static int __folio_migrate_mapping(struct address_space *mapping,
 
 		return 0;
 	}
+
+	if (cc_xas_is_ccxarray(&xas))
+		return __cc_folio_migrate_mapping(mapping, newfolio, folio,
+						  expected_count);
 
 	oldzone = folio_zone(folio);
 	newzone = folio_zone(newfolio);
@@ -712,6 +719,146 @@ static int __folio_migrate_mapping(struct address_space *mapping,
 	return 0;
 }
 
+static int __cc_folio_migrate_mapping(struct address_space *mapping,
+		struct folio *newfolio, struct folio *folio, int expected_count)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), folio->index);
+	struct swap_cluster_info *ci = NULL;
+	struct zone *oldzone, *newzone;
+	int dirty;
+	long nr = folio_nr_pages(folio);
+
+	if (!mapping) {
+		/* Take off deferred split queue while frozen and memcg set */
+		if (folio_test_large(folio) &&
+		    folio_test_large_rmappable(folio)) {
+			if (!folio_ref_freeze(folio, expected_count))
+				return -EAGAIN;
+			folio_unqueue_deferred_split(folio);
+			folio_ref_unfreeze(folio, expected_count);
+		}
+
+		/* No turning back from here */
+		newfolio->index = folio->index;
+		newfolio->mapping = folio->mapping;
+		if (folio_test_anon(folio) && folio_test_large(folio) &&
+		    !folio_test_hugetlb(folio))
+			mod_mthp_stat(folio_order(folio), MTHP_STAT_NR_ANON, 1);
+		if (folio_test_swapbacked(folio))
+			__folio_set_swapbacked(newfolio);
+
+		return 0;
+	}
+
+	oldzone = folio_zone(folio);
+	newzone = folio_zone(newfolio);
+
+	if (folio_test_swapcache(folio))
+		ci = swap_cluster_get_and_lock_irq(folio);
+	else
+		cc_xas_lock_irq(&xas);
+
+	if (!folio_ref_freeze(folio, expected_count)) {
+		if (ci)
+			swap_cluster_unlock_irq(ci);
+		else
+			cc_xas_unlock_irq(&xas);
+		return -EAGAIN;
+	}
+
+	/* Take off deferred split queue while frozen and memcg set */
+	folio_unqueue_deferred_split(folio);
+
+	/*
+	 * Now we know that no one else is looking at the folio:
+	 * no turning back from here.
+	 */
+	newfolio->index = folio->index;
+	newfolio->mapping = folio->mapping;
+	if (folio_test_anon(folio) && folio_test_large(folio))
+		mod_mthp_stat(folio_order(folio), MTHP_STAT_NR_ANON, 1);
+	folio_ref_add(newfolio, nr); /* add cache reference */
+	if (folio_test_swapbacked(folio))
+		__folio_set_swapbacked(newfolio);
+	if (folio_test_swapcache(folio)) {
+		folio_set_swapcache(newfolio);
+		newfolio->private = folio_get_private(folio);
+	}
+
+	/* Move dirty while folio refs frozen and newfolio not yet exposed */
+	dirty = folio_test_dirty(folio);
+	if (dirty) {
+		folio_clear_dirty(folio);
+		folio_set_dirty(newfolio);
+	}
+
+	if (folio_test_swapcache(folio))
+		__swap_cache_replace_folio(ci, folio, newfolio);
+	else
+		cc_xas_store(&xas, newfolio);
+
+	/*
+	 * Drop cache reference from old folio by unfreezing
+	 * to one less reference.
+	 * We know this isn't the last reference.
+	 */
+	folio_ref_unfreeze(folio, expected_count - nr);
+
+	/* Leave irq disabled to prevent preemption while updating stats */
+	if (ci)
+		swap_cluster_unlock(ci);
+	else
+		cc_xas_unlock(&xas);
+
+	/*
+	 * If moved to a different zone then also account
+	 * the folio for that zone. Other VM counters will be
+	 * taken care of when we establish references to the
+	 * new folio and drop references to the old folio.
+	 *
+	 * Note that anonymous folios are accounted for
+	 * via NR_FILE_PAGES and NR_ANON_MAPPED if they
+	 * are mapped to swap space.
+	 */
+	if (newzone != oldzone) {
+		struct lruvec *old_lruvec, *new_lruvec;
+		struct mem_cgroup *memcg;
+
+		rcu_read_lock();
+		memcg = folio_memcg(folio);
+		old_lruvec = mem_cgroup_lruvec(memcg, oldzone->zone_pgdat);
+		new_lruvec = mem_cgroup_lruvec(memcg, newzone->zone_pgdat);
+
+		mod_lruvec_state(old_lruvec, NR_FILE_PAGES, -nr);
+		mod_lruvec_state(new_lruvec, NR_FILE_PAGES, nr);
+		if (folio_test_swapbacked(folio) && !folio_test_swapcache(folio)) {
+			mod_lruvec_state(old_lruvec, NR_SHMEM, -nr);
+			mod_lruvec_state(new_lruvec, NR_SHMEM, nr);
+
+			if (folio_test_pmd_mappable(folio)) {
+				mod_lruvec_state(old_lruvec, NR_SHMEM_THPS, -nr);
+				mod_lruvec_state(new_lruvec, NR_SHMEM_THPS, nr);
+			}
+		}
+#ifdef CONFIG_SWAP
+		if (folio_test_swapcache(folio)) {
+			mod_lruvec_state(old_lruvec, NR_SWAPCACHE, -nr);
+			mod_lruvec_state(new_lruvec, NR_SWAPCACHE, nr);
+		}
+#endif
+		if (dirty && mapping_can_writeback(mapping)) {
+			mod_lruvec_state(old_lruvec, NR_FILE_DIRTY, -nr);
+			__mod_zone_page_state(oldzone, NR_ZONE_WRITE_PENDING, -nr);
+			mod_lruvec_state(new_lruvec, NR_FILE_DIRTY, nr);
+			__mod_zone_page_state(newzone, NR_ZONE_WRITE_PENDING, nr);
+		}
+		rcu_read_unlock();
+	}
+	local_irq_enable();
+
+	return 0;
+}
+
 int folio_migrate_mapping(struct address_space *mapping,
 		struct folio *newfolio, struct folio *folio, int extra_count)
 {
@@ -724,6 +871,9 @@ int folio_migrate_mapping(struct address_space *mapping,
 }
 EXPORT_SYMBOL(folio_migrate_mapping);
 
+static int cc_migrate_huge_page_move_mapping(struct address_space *mapping,
+				   struct folio *dst, struct folio *src);
+
 /*
  * The expected number of remaining references is the same as that
  * of folio_migrate_mapping().
@@ -733,6 +883,9 @@ int migrate_huge_page_move_mapping(struct address_space *mapping,
 {
 	XA_STATE(xas, &mapping->i_pages, src->index);
 	int rc, expected_count = folio_expected_ref_count(src) + 1;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_migrate_huge_page_move_mapping(mapping, dst, src);
 
 	if (folio_ref_count(src) != expected_count)
 		return -EAGAIN;
@@ -757,6 +910,40 @@ int migrate_huge_page_move_mapping(struct address_space *mapping,
 	folio_ref_unfreeze(src, expected_count - folio_nr_pages(src));
 
 	xas_unlock_irq(&xas);
+
+	return 0;
+}
+
+static int cc_migrate_huge_page_move_mapping(struct address_space *mapping,
+				   struct folio *dst, struct folio *src)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), src->index);
+	int rc, expected_count = folio_expected_ref_count(src) + 1;
+
+	if (folio_ref_count(src) != expected_count)
+		return -EAGAIN;
+
+	rc = folio_mc_copy(dst, src);
+	if (unlikely(rc))
+		return rc;
+
+	cc_xas_lock_irq(&xas);
+	if (!folio_ref_freeze(src, expected_count)) {
+		cc_xas_unlock_irq(&xas);
+		return -EAGAIN;
+	}
+
+	dst->index = src->index;
+	dst->mapping = src->mapping;
+
+	folio_ref_add(dst, folio_nr_pages(dst));
+
+	cc_xas_store(&xas, dst);
+	cc_xas_clear_xa_node(&xas);
+
+	folio_ref_unfreeze(src, expected_count - folio_nr_pages(src));
+
+	cc_xas_unlock_irq(&xas);
 
 	return 0;
 }
