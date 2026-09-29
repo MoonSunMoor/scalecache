@@ -3753,6 +3753,7 @@ struct wb_domain *mem_cgroup_wb_domain(struct bdi_writeback *wb)
 
 	return &memcg->cgwb_domain;
 }
+EXPORT_SYMBOL_GPL(mem_cgroup_wb_domain);
 
 /**
  * mem_cgroup_wb_stats - retrieve writeback related stats from its memcg
@@ -3796,6 +3797,7 @@ void mem_cgroup_wb_stats(struct bdi_writeback *wb, unsigned long *pfilepages,
 		memcg = parent;
 	}
 }
+EXPORT_SYMBOL_GPL(mem_cgroup_wb_stats);
 
 /*
  * Foreign dirty flushing
@@ -3920,6 +3922,7 @@ void mem_cgroup_flush_foreign(struct bdi_writeback *wb)
 		}
 	}
 }
+EXPORT_SYMBOL_GPL(mem_cgroup_flush_foreign);
 
 #else	/* CONFIG_CGROUP_WRITEBACK */
 

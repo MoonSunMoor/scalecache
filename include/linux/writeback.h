@@ -374,5 +374,6 @@ void sb_clear_inode_writeback(struct inode *inode);
  * 4MB minimal write chunk size
  */
 #define MIN_WRITEBACK_PAGES	(4096UL >> (PAGE_SHIFT - 10))
+long wb_do_writeback(struct bdi_writeback *wb);
 
 #endif		/* WRITEBACK_H */

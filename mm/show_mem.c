@@ -20,7 +20,10 @@
 
 atomic_long_t _totalram_pages __read_mostly;
 EXPORT_SYMBOL(_totalram_pages);
-unsigned long totalreserve_pages __read_mostly;
+
+//unsigned long totalreserve_pages __read_mostly;
+extern unsigned long totalreserve_pages;
+
 unsigned long totalcma_pages __read_mostly;
 
 static inline void show_node(struct zone *zone)
