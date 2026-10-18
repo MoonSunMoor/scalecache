@@ -400,6 +400,7 @@ static void __address_space_init_once(struct address_space *mapping)
 	init_rwsem(&mapping->i_mmap_rwsem);
 	INIT_LIST_HEAD(&mapping->private_list);
 	spin_lock_init(&mapping->private_lock);
+	spin_lock_init(&mapping->nr_lock);
 	mapping->i_mmap = RB_ROOT_CACHED;
 }
 
@@ -604,13 +605,17 @@ void dump_mapping(const struct address_space *mapping)
 
 void clear_inode(struct inode *inode)
 {
+	unsigned long flags;
 	/*
 	 * We have to cycle the i_pages lock here because reclaim can be in the
 	 * process of removing the last page (in __filemap_remove_folio())
 	 * and we must not free the mapping under it.
 	 */
 	xa_lock_irq(&inode->i_data.i_pages);
+	spin_lock_irqsave(&inode->i_data.nr_lock, flags);
 	BUG_ON(inode->i_data.nrpages);
+	spin_unlock_irqrestore(&inode->i_data.nr_lock, flags);
+
 	/*
 	 * Almost always, mapping_empty(&inode->i_data) here; but there are
 	 * two known and long-standing ways in which nodes may get left behind
@@ -806,6 +811,8 @@ static enum lru_status inode_lru_isolate(struct list_head *item,
 {
 	struct list_head *freeable = arg;
 	struct inode	*inode = container_of(item, struct inode, i_lru);
+	unsigned long nrpages;
+	unsigned long flags;
 
 	/*
 	 * We are inverting the lru lock/inode->i_lock here, so use a
@@ -841,7 +848,11 @@ static enum lru_status inode_lru_isolate(struct list_head *item,
 	 * page cache in order to free up struct inodes: lowmem might
 	 * be under pressure before the cache inside the highmem zone.
 	 */
-	if (inode_has_buffers(inode) || !mapping_empty(&inode->i_data)) {
+	spin_lock_irqsave(&inode->i_data.nr_lock, flags);
+	nrpages = inode->i_data.nrpages;
+	spin_unlock_irqrestore(&inode->i_data.nr_lock, flags);
+
+	if (inode_has_buffers(inode) || !mapping_empty(&inode->i_data) || nrpages) {
 		__iget(inode);
 		spin_unlock(&inode->i_lock);
 		spin_unlock(lru_lock);
