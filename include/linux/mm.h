@@ -3338,6 +3338,9 @@ extern void truncate_inode_pages_final(struct address_space *);
 extern vm_fault_t filemap_fault(struct vm_fault *vmf);
 extern vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 		pgoff_t start_pgoff, pgoff_t end_pgoff);
+extern vm_fault_t cc_filemap_map_pages(struct vm_fault *vmf,
+		pgoff_t start_pgoff, pgoff_t end_pgoff);
+
 extern vm_fault_t filemap_page_mkwrite(struct vm_fault *vmf);
 
 extern unsigned long stack_guard_gap;
