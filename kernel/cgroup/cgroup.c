@@ -2449,6 +2449,7 @@ struct task_struct *cgroup_taskset_first(struct cgroup_taskset *tset,
 
 	return cgroup_taskset_next(tset, dst_cssp);
 }
+EXPORT_SYMBOL(cgroup_taskset_first);
 
 /**
  * cgroup_taskset_next - iterate to the next task in taskset
@@ -2495,6 +2496,7 @@ struct task_struct *cgroup_taskset_next(struct cgroup_taskset *tset,
 
 	return NULL;
 }
+EXPORT_SYMBOL(cgroup_taskset_next);
 
 /**
  * cgroup_migrate_execute - migrate a taskset
@@ -4474,6 +4476,7 @@ void cgroup_file_notify(struct cgroup_file *cfile)
 	}
 	spin_unlock_irqrestore(&cgroup_file_kn_lock, flags);
 }
+EXPORT_SYMBOL(cgroup_file_notify);
 
 /**
  * cgroup_file_show - show or hide a hidden cgroup file
@@ -4558,6 +4561,7 @@ struct cgroup_subsys_state *css_next_child(struct cgroup_subsys_state *pos,
 		return next;
 	return NULL;
 }
+EXPORT_SYMBOL(css_next_child);
 
 /**
  * css_next_descendant_pre - find the next descendant for pre-order walk
@@ -4927,6 +4931,7 @@ void css_task_iter_start(struct cgroup_subsys_state *css, unsigned int flags,
 
 	spin_unlock_irq(&css_set_lock);
 }
+EXPORT_SYMBOL(css_task_iter_start);
 
 /**
  * css_task_iter_next - return the next task for the iterator
@@ -4960,6 +4965,7 @@ struct task_struct *css_task_iter_next(struct css_task_iter *it)
 
 	return it->cur_task;
 }
+EXPORT_SYMBOL(css_task_iter_next);
 
 /**
  * css_task_iter_end - finish task iteration
@@ -4982,6 +4988,7 @@ void css_task_iter_end(struct css_task_iter *it)
 	if (it->cur_task)
 		put_task_struct(it->cur_task);
 }
+EXPORT_SYMBOL(css_task_iter_end);
 
 static void cgroup_procs_release(struct kernfs_open_file *of)
 {
@@ -6791,6 +6798,7 @@ struct cgroup_subsys_state *css_tryget_online_from_dir(struct dentry *dentry,
 	rcu_read_unlock();
 	return css;
 }
+EXPORT_SYMBOL(css_tryget_online_from_dir);
 
 /**
  * css_from_id - lookup css by id

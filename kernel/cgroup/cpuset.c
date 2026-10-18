@@ -47,6 +47,9 @@
 DEFINE_STATIC_KEY_FALSE(cpusets_pre_enable_key);
 DEFINE_STATIC_KEY_FALSE(cpusets_enabled_key);
 
+EXPORT_SYMBOL(cpusets_pre_enable_key);
+EXPORT_SYMBOL(cpusets_enabled_key);
+
 /*
  * There could be abnormal cpuset configurations for cpu or memory
  * node binding, add this key to provide a quick low-cost judgment
@@ -4056,6 +4059,7 @@ int cpuset_nodemask_valid_mems_allowed(nodemask_t *nodemask)
 {
 	return nodes_intersects(*nodemask, current->mems_allowed);
 }
+EXPORT_SYMBOL(cpuset_nodemask_valid_mems_allowed);
 
 /*
  * nearest_hardwall_ancestor() - Returns the nearest mem_exclusive or
@@ -4245,6 +4249,7 @@ void cpuset_print_current_mems_allowed(void)
  */
 
 int cpuset_memory_pressure_enabled __read_mostly;
+EXPORT_SYMBOL(cpuset_memory_pressure_enabled);
 
 /*
  * __cpuset_memory_pressure_bump - keep stats of per-cpuset reclaims.
@@ -4270,6 +4275,7 @@ void __cpuset_memory_pressure_bump(void)
 	fmeter_markevent(&task_cs(current)->fmeter);
 	rcu_read_unlock();
 }
+EXPORT_SYMBOL(__cpuset_memory_pressure_bump);
 
 #ifdef CONFIG_PROC_PID_CPUSET
 /*

@@ -3159,6 +3159,7 @@ void __memcg_kmem_uncharge_page(struct page *page, int order)
 	folio->memcg_data = 0;
 	obj_cgroup_put(objcg);
 }
+EXPORT_SYMBOL_GPL(__memcg_kmem_uncharge_page);
 
 void mod_objcg_state(struct obj_cgroup *objcg, struct pglist_data *pgdat,
 		     enum node_stat_item idx, int nr)
@@ -3428,6 +3429,7 @@ void split_page_memcg(struct page *head, unsigned int nr)
 	else
 		css_get_many(&memcg->css, nr - 1);
 }
+EXPORT_SYMBOL_GPL(split_page_memcg);
 
 #ifdef CONFIG_SWAP
 /**
