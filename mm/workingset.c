@@ -653,6 +653,41 @@ void workingset_update_node(struct xa_node *node)
 	}
 }
 
+void cc_workingset_update_node(struct cc_xa_node *node)
+{
+	struct page *page = virt_to_page(node);
+
+	/*
+	 * Track non-empty nodes that contain only shadow entries;
+	 * unlink those that contain pages or are being freed.
+	 *
+	 * This retains the original i_pages lock assertion and unlocked
+	 * list_empty() checks. Original cc filemap insertion does not take
+	 * i_pages.xa_lock, so that path violates this assertion and does not
+	 * serialize these checks against concurrent updates or reclaim.
+	 * The port preserves that pre-existing locking mismatch.
+	 */
+	lockdep_assert_held(&node->array->xa_lock);
+
+	while (__atomic_load_n(&node->gc_flag, __ATOMIC_SEQ_CST))
+		cpu_relax();
+
+	if (__atomic_load_n(&node->del, __ATOMIC_SEQ_CST))
+		return;
+
+	if (node->count && node->count == node->nr_values) {
+		if (list_empty(&node->private_list)) {
+			list_lru_add_obj(&shadow_nodes, &node->private_list);
+			__inc_node_page_state(page, WORKINGSET_NODES);
+		}
+	} else {
+		if (!list_empty(&node->private_list)) {
+			list_lru_del_obj(&shadow_nodes, &node->private_list);
+			__dec_node_page_state(page, WORKINGSET_NODES);
+		}
+	}
+}
+
 static unsigned long count_shadow_nodes(struct shrinker *shrinker,
 					struct shrink_control *sc)
 {
