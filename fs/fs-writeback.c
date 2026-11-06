@@ -154,16 +154,7 @@ EXPORT_SYMBOL(wb_wakeup);
  * We have to be careful not to postpone flush work if it is scheduled for
  * earlier. Thus we use queue_delayed_work().
  */
-static void wb_wakeup_delayed(struct bdi_writeback *wb)
-{
-	unsigned long timeout;
 
-	timeout = msecs_to_jiffies(dirty_writeback_interval * 10);
-	spin_lock_irq(&wb->work_lock);
-	if (test_bit(WB_registered, &wb->state))
-		queue_delayed_work(bdi_wq, &wb->dwork, timeout);
-	spin_unlock_irq(&wb->work_lock);
-}
 
 void finish_writeback_work(struct wb_writeback_work *work)
 {
@@ -1593,7 +1584,7 @@ out:
 // static void queue_io(struct bdi_writeback *wb, struct wb_writeback_work *work,
 //		     unsigned long dirtied_before)
 
-void queue_io(struct bdi_writeback *wb, struct wb_writeback_work *work,
+void wb_queue_io(struct bdi_writeback *wb, struct wb_writeback_work *work,
 		     unsigned long dirtied_before)
 {
 	int moved;
@@ -1610,7 +1601,7 @@ void queue_io(struct bdi_writeback *wb, struct wb_writeback_work *work,
 		wb_io_lists_populated(wb);
 	trace_writeback_queue_io(wb, work, dirtied_before, moved);
 }
-EXPORT_SYMBOL(queue_io);
+EXPORT_SYMBOL(wb_queue_io);
 
 static int write_inode(struct inode *inode, struct writeback_control *wbc)
 {
@@ -2195,7 +2186,7 @@ static long writeback_inodes_wb(struct bdi_writeback *wb, long nr_pages,
 	blk_start_plug(&plug);
 	spin_lock(&wb->list_lock);
 	if (list_empty(&wb->b_io))
-		queue_io(wb, &work, jiffies);
+		wb_queue_io(wb, &work, jiffies);
 	__writeback_inodes_wb(wb, &work);
 	spin_unlock(&wb->list_lock);
 	blk_finish_plug(&plug);
@@ -2271,7 +2262,7 @@ static long wb_writeback(struct bdi_writeback *wb,
 			} else if (work->for_background)
 				dirtied_before = jiffies;
 
-			queue_io(wb, work, dirtied_before);
+			wb_queue_io(wb, work, dirtied_before);
 			queued = true;
 		}
 		if (work->sb)

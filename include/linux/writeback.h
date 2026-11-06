@@ -376,4 +376,35 @@ void sb_clear_inode_writeback(struct inode *inode);
 #define MIN_WRITEBACK_PAGES	(4096UL >> (PAGE_SHIFT - 10))
 long wb_do_writeback(struct bdi_writeback *wb);
 
+/* dflush / ScaleCache forward declarations and exposed prototypes */
+struct wb_writeback_work;
+struct dirty_throttle_control;
+
+void wb_wakeup(struct bdi_writeback *wb);
+void finish_writeback_work(struct wb_writeback_work *work);
+unsigned long get_nr_dirty_pages(void);
+void wb_queue_io(struct bdi_writeback *wb, struct wb_writeback_work *work, unsigned long dirtied_before);
+long wb_check_old_data_flush(struct bdi_writeback *wb);
+long wb_check_start_all(struct bdi_writeback *wb);
+long wb_do_writeback_modified(struct bdi_writeback *wb);
+void wb_wakeup_delayed(struct bdi_writeback *wb);
+
+unsigned long global_dirtyable_memory(void);
+void domain_dirty_limits(struct dirty_throttle_control *dtc);
+unsigned long dirty_freerun_ceiling(unsigned long thresh, unsigned long bg_thresh);
+void mdtc_calc_avail(struct dirty_throttle_control *mdtc,
+			    unsigned long filepages, unsigned long headroom);
+void wb_position_ratio(struct dirty_throttle_control *dtc);
+void __wb_update_bandwidth(struct dirty_throttle_control *gdtc,
+				  struct dirty_throttle_control *mdtc,
+				  bool update_ratelimit);
+unsigned long dirty_poll_interval(unsigned long dirty, unsigned long thresh);
+unsigned long wb_max_pause(struct bdi_writeback *wb,
+				  unsigned long wb_dirty);
+long wb_min_pause(struct bdi_writeback *wb,
+			 long max_pause,
+			 unsigned long task_ratelimit,
+			 unsigned long dirty_ratelimit,
+			 int *nr_dirtied_pause);
+
 #endif		/* WRITEBACK_H */
