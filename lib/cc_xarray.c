@@ -9,6 +9,7 @@
 
 #include <linux/bitmap.h>
 #include <linux/export.h>
+#include <linux/irqflags.h>
 #include <linux/list.h>
 #include <linux/slab.h>
 
@@ -592,14 +593,16 @@ static void cc_xas_delete_node(struct cc_xa_state *xas)
 		/* Check if there are other threads in the parent node */
 		if (__atomic_load_n(&node->parent->refcnt, __ATOMIC_SEQ_CST) > 1) {
 			CC_XA_NODE_BUG_ON(node, !__sync_bool_compare_and_swap(&node->gc_flag, 1, 0));
-			cc_xas_set_xa_node(xas, node);
+			if (!cc_xas_set_xa_node(xas, node) && cc_xas_error(xas) == -EBUSY)
+				cc_xas_set_xa_node(xas, CC_XAS_RESTART);
 			break;
 		}
 
 		/* Check if there are other threads in the @node */
 		if (__atomic_load_n(&node->refcnt, __ATOMIC_SEQ_CST) > 1) {
 			CC_XA_NODE_BUG_ON(node, !__sync_bool_compare_and_swap(&node->gc_flag, 1, 0));
-			cc_xas_set_xa_node(xas, node);
+			if (!cc_xas_set_xa_node(xas, node) && cc_xas_error(xas) == -EBUSY)
+				cc_xas_set_xa_node(xas, CC_XAS_RESTART);
 			break;
 		}
 
@@ -607,6 +610,9 @@ static void cc_xas_delete_node(struct cc_xa_state *xas)
 		//xas->xa_node = parent;
 		if (!cc_xas_set_xa_node(xas, parent)) {
 			__atomic_store_n(&node->gc_flag, 0, __ATOMIC_SEQ_CST);
+			/* The erase is committed; an empty linked child can wait for GC. */
+			if (cc_xas_error(xas) == -EBUSY)
+				cc_xas_set_xa_node(xas, CC_XAS_RESTART);
 			return;
 		}
 		xas->xa_offset = node->offset;
@@ -1255,6 +1261,26 @@ static void node_set_marks(struct cc_xa_node *node, unsigned int offset,
 	}
 }
 
+static void cc_xas_init_node_for_split(struct cc_xa_state *xas,
+		struct cc_xa_node *node, void *entry)
+{
+	unsigned int i;
+	void *sibling = NULL;
+
+	node->array = xas->xa;
+	node->refcnt = 0;
+	node->gc_flag = 0;
+	node->del = 0;
+	for (i = 0; i < CC_XA_CHUNK_SIZE; i++) {
+		if ((i & xas->xa_sibs) == 0) {
+			RCU_INIT_POINTER(node->slots[i], entry);
+			sibling = cc_xa_mk_sibling(i);
+		} else {
+			RCU_INIT_POINTER(node->slots[i], sibling);
+		}
+	}
+}
+
 /**
  * cc_xas_split_alloc() - Allocate memory for splitting an entry.
  * @xas: XArray operation state.
@@ -1273,7 +1299,6 @@ void cc_xas_split_alloc(struct cc_xa_state *xas, void *entry, unsigned int order
 		gfp_t gfp)
 {
 	unsigned int sibs = (1 << (order % CC_XA_CHUNK_SHIFT)) - 1;
-	unsigned int mask = xas->xa_sibs;
 
 	/* XXX: no support for splitting really large entries yet */
 	if (WARN_ON(xas->xa_shift + 2 * CC_XA_CHUNK_SHIFT <= order))
@@ -1285,25 +1310,12 @@ void cc_xas_split_alloc(struct cc_xa_state *xas, void *entry, unsigned int order
 		gfp |= __GFP_ACCOUNT;
 
 	do {
-		unsigned int i;
-		void *sibling;
 		struct cc_xa_node *node;
 
 		node = kmem_cache_alloc_lru(radix_tree_node_cachep, xas->xa_lru, gfp);
 		if (!node)
 			goto nomem;
-		node->array = xas->xa;
-		node->refcnt = 0;
-		node->gc_flag = 0;
-		node->del = 0;
-		for (i = 0; i < CC_XA_CHUNK_SIZE; i++) {
-			if ((i & mask) == 0) {
-				RCU_INIT_POINTER(node->slots[i], entry);
-				sibling = cc_xa_mk_sibling(i);
-			} else {
-				RCU_INIT_POINTER(node->slots[i], sibling);
-			}
-		}
+		cc_xas_init_node_for_split(xas, node, entry);
 		RCU_INIT_POINTER(node->parent, xas->xa_alloc);
 		xas->xa_alloc = node;
 	} while (sibs-- > 0);
@@ -1389,6 +1401,171 @@ void cc_xas_split(struct cc_xa_state *xas, void *entry, unsigned int order)
 	cc_xas_rewind_refcnt(xas);
 }
 EXPORT_SYMBOL_GPL(cc_xas_split);
+
+/**
+ * cc_xas_get_order() - Get the order at a loaded canonical cursor.
+ * @xas: Valid operation state after loading a non-sibling entry.
+ *
+ * Hold xa_lock and RCU. With lockless writers this is an observed order;
+ * cc_xas_try_split() revalidates it under its node gate before mutation.
+ * This does not acquire or release cursor pins.
+ * Return: The order of the entry.
+ */
+int cc_xas_get_order(struct cc_xa_state *xas)
+{
+	int order = 0;
+
+	if (!xas->xa_node)
+		return 0;
+	CC_XA_NODE_BUG_ON(xas->xa_node,
+		cc_xa_is_sibling(cc_xa_entry(xas->xa, xas->xa_node, xas->xa_offset)));
+	for (;;) {
+		unsigned int slot = xas->xa_offset + (1U << order);
+
+		if (slot >= CC_XA_CHUNK_SIZE ||
+		    !cc_xa_is_sibling(cc_xa_entry(xas->xa, xas->xa_node, slot)))
+			break;
+		order++;
+	}
+	return order + xas->xa_node->shift;
+}
+EXPORT_SYMBOL_GPL(cc_xas_get_order);
+
+/**
+ * cc_xas_try_split_min_order() - Smallest order for one bounded split.
+ * @order: Current entry order.
+ *
+ * Return: Minimum replacement order requiring at most one new node.
+ * Context: Any context.
+ */
+unsigned int cc_xas_try_split_min_order(unsigned int order)
+{
+	if (order % CC_XA_CHUNK_SHIFT == 0)
+		return order == 0 ? 0 : order - 1;
+	return order - (order % CC_XA_CHUNK_SHIFT);
+}
+EXPORT_SYMBOL_GPL(cc_xas_try_split_min_order);
+
+/**
+ * cc_xas_try_split() - Split an entry using at most one new node.
+ * @xas: Operation state containing the replacement order.
+ * @entry: Observed entry to preserve in each replacement (must still match).
+ * @order: Current entry order.
+ *
+ * A required child uses a preallocated node or GFP_NOWAIT, with the state's
+ * accounting flags and LRU. Unsupported multi-node splits set -EINVAL;
+ * allocation failure sets -ENOMEM without changing the entry. Use
+ * cc_xas_try_split_min_order() to advance towards the desired order.
+ *
+ * Hold xa_lock and RCU. A node-local gate excludes new pins while the split
+ * owns the sole cursor pin. Existing pins, stale entry/order or a busy node
+ * return -EAGAIN without mutation; pin admission into an active split returns
+ * -EBUSY. Clear cursors and drop locks before rescanning either conflict.
+ * IRQs remain disabled while the gate is held, so a local interrupt cannot
+ * wait on a split it interrupted. No cc_lock is held across update callbacks;
+ * callbacks must not mutate this array. RCU-only readers use the same slot
+ * publication as upstream; this is not an atomic lockless split transaction.
+ * Set callback/LRU before allocation (cc_mapping_set_update() sets both).
+ * Traversal references are unwound on exit; clear the final cursor pin before
+ * dropping RCU. On -ENOMEM, drop locks, use cc_xas_nomem(), and revalidate.
+ *
+ * Context: Any context holding xa_lock and RCU; allocation uses GFP_NOWAIT.
+ */
+void cc_xas_try_split(struct cc_xa_state *xas, void *entry, unsigned int order)
+{
+	unsigned int sibs = (1U << (order % CC_XA_CHUNK_SHIFT)) - 1;
+	unsigned int offset, marks;
+	struct cc_xa_node *node;
+	void *curr = cc_xas_load(xas, false);
+	int values = 0, error = 0;
+	unsigned long flags, irq_flags;
+	gfp_t gfp = GFP_NOWAIT;
+
+	node = xas->xa_node;
+	if (cc_xas_not_node(node)) {
+		cc_xas_rewind_refcnt(xas);
+		if (!cc_xas_error(xas) && order)
+			cc_xas_set_err(xas, -EAGAIN);
+		return;
+	}
+	/* Keep only our cursor pin before testing for competing users. */
+	cc_xas_rewind_refcnt(xas);
+	local_irq_save(irq_flags);
+	if (!__sync_bool_compare_and_swap(&node->gc_flag, 0, CC_XA_GC_SPLITTING)) {
+		local_irq_restore(irq_flags);
+		cc_xas_set_err(xas, -EAGAIN);
+		return;
+	}
+	/* Pin admission checks the gate before and after its atomic increment. */
+	if (__atomic_load_n(&node->refcnt, __ATOMIC_SEQ_CST) != 1 ||
+	    node->del || cc_xa_entry(xas->xa, node, xas->xa_offset) != entry ||
+	    cc_xas_get_order(xas) != order) {
+		error = -EAGAIN;
+		goto unlock;
+	}
+	curr = entry; /* Revalidated under the gate, not the earlier load snapshot. */
+	if (xas->xa->xa_flags & CC_XA_FLAGS_ACCOUNT)
+		gfp |= __GFP_ACCOUNT;
+	marks = node_get_marks(node, xas->xa_offset);
+	offset = xas->xa_offset + sibs;
+	if (xas->xa_shift < node->shift) {
+		struct cc_xa_node *child = xas->xa_alloc;
+		unsigned int expected_sibs =
+			(1U << ((order - 1) % CC_XA_CHUNK_SHIFT)) - 1;
+
+		/* Neither multiple siblings nor multiple levels fit in one node. */
+		if (sibs || xas->xa_sibs != expected_sibs ||
+		    xas->xa_shift + CC_XA_CHUNK_SHIFT != node->shift) {
+			error = -EINVAL;
+			goto unlock;
+		}
+		if (!child) {
+			child = kmem_cache_alloc_lru(radix_tree_node_cachep,
+						   xas->xa_lru, gfp);
+			if (!child) {
+				error = -ENOMEM;
+				goto unlock;
+			}
+			RCU_INIT_POINTER(child->parent, NULL);
+		}
+		cc_xas_init_node_for_split(xas, child, entry);
+		xas->xa_alloc = rcu_dereference_raw(child->parent);
+		child->shift = node->shift - CC_XA_CHUNK_SHIFT;
+		child->offset = offset;
+		child->count = CC_XA_CHUNK_SIZE;
+		child->nr_values = cc_xa_is_value(entry) ? CC_XA_CHUNK_SIZE : 0;
+		RCU_INIT_POINTER(child->parent, node);
+		node_set_marks(node, offset, child, xas->xa_sibs, marks);
+		rcu_assign_pointer(node->slots[offset], cc_xa_mk_node(child));
+		if (cc_xa_is_value(curr))
+			values--;
+		cc_xas_update(xas, child);
+	} else {
+		do {
+			unsigned int canon = offset - xas->xa_sibs;
+
+			node_set_marks(node, canon, NULL, 0, marks);
+			rcu_assign_pointer(node->slots[canon], entry);
+			while (offset > canon)
+				rcu_assign_pointer(node->slots[offset--],
+						   cc_xa_mk_sibling(canon));
+			values += (cc_xa_is_value(entry) - cc_xa_is_value(curr)) *
+				  (xas->xa_sibs + 1);
+		} while (offset-- > xas->xa_offset);
+	}
+	spin_lock_irqsave(&node->cc_lock, flags);
+	__sync_fetch_and_add(&node->nr_values, values);
+	spin_unlock_irqrestore(&node->cc_lock, flags);
+	cc_xas_update(xas, node);
+unlock:
+	__atomic_store_n(&node->gc_flag, 0, __ATOMIC_SEQ_CST);
+	local_irq_restore(irq_flags);
+	if (error) {
+		cc_xas_destroy(xas);
+		cc_xas_set_err(xas, error);
+	}
+}
+EXPORT_SYMBOL_GPL(cc_xas_try_split);
 #endif
 
 /**

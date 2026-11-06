@@ -24,7 +24,8 @@ xarray: $(CORE_OFILES) xarray.o
 # Run make clean before changing SHIFT; targets share node-cache objects.
 cc-xarray: cc-xarray.o cc-xarray-shared.o $(SHARED_OFILES)
 cc-xarray.o cc-xarray-shared.o: $(SHARED_DEPS) \
-	../../../include/linux/cc_xarray.h ../shared/linux/cc_xarray.h
+	../../../include/linux/cc_xarray.h ../shared/linux/cc_xarray.h \
+	../shared/linux/irqflags.h
 cc-xarray-shared.o: ../../../lib/cc_xarray.c
 
 maple: $(CORE_OFILES) maple.o

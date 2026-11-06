@@ -16,8 +16,12 @@
  * writers and readers; destruction and subtree replacement exclude all users.
  * Pin exhaustion reports -EOVERFLOW in the advanced state without changing
  * the entry or reference count. Public RCU reads do not consume cursor pins.
- * Splitting requires exclusion of concurrent writers and garbage
- * collection; taking xa_lock does not serialize lockless cc_xas_store().
+ * Preallocated cc_xas_split() requires external writer/GC exclusion;
+ * xa_lock alone does not serialize lockless cc_xas_store(). In contrast,
+ * cc_xas_try_split() gates its node and reports -EAGAIN on a stale conflict
+ * or competing pin. Advanced operations encountering that gate return
+ * -EBUSY before using the new pin. Drop cursors/locks and restart the full
+ * conflict scan on either error; an ENOMEM-only filemap retry is insufficient.
  */
 
 #include <linux/bitmap.h>
@@ -1121,6 +1125,7 @@ static inline void cc_xa_release(struct cc_xarray *xa, unsigned long index)
 #define CC_XA_MARK_LONGS		BITS_TO_LONGS(CC_XA_CHUNK_SIZE)
 
 #define CC_XA_GC_RETIRED 2
+#define CC_XA_GC_SPLITTING 3
 #define CC_XA_REF_RETIRED USHRT_MAX
 
 /*
@@ -1452,13 +1457,23 @@ static inline int cc_xa_pin_node(struct cc_xa_node *node)
 	for (;;) {
 		unsigned short old;
 
+		if (__atomic_load_n(&node->gc_flag, __ATOMIC_SEQ_CST) ==
+		    CC_XA_GC_SPLITTING)
+			return -EBUSY;
 		if (refs == CC_XA_REF_RETIRED)
 			return -EAGAIN;
 		if (refs == CC_XA_REF_RETIRED - 1)
 			return -EOVERFLOW;
 		old = __sync_val_compare_and_swap(&node->refcnt, refs, refs + 1);
-		if (old == refs)
+		if (old == refs) {
+			/* A split may have closed admission after our first check. */
+			if (__atomic_load_n(&node->gc_flag, __ATOMIC_SEQ_CST) ==
+			    CC_XA_GC_SPLITTING) {
+				__sync_fetch_and_sub(&node->refcnt, 1);
+				return -EBUSY;
+			}
 			return 0;
+		}
 		refs = old;
 	}
 }
@@ -1666,6 +1681,14 @@ void cc_xas_create_range(struct cc_xa_state *);
 int cc_xa_get_order(struct cc_xarray *, unsigned long index);
 void cc_xas_split(struct cc_xa_state *, void *entry, unsigned int order);
 void cc_xas_split_alloc(struct cc_xa_state *, void *entry, unsigned int order, gfp_t);
+int cc_xas_get_order(struct cc_xa_state *xas);
+/* Try-split holds xa_lock/RCU and gates the affected node against new pins.
+ * Conflicts return -EAGAIN; advanced pin admission during a split returns
+ * -EBUSY. Clear cursors and drop locks before restarting the conflict scan.
+ * Set callback/LRU before allocation; entry must match the observed entry.
+ */
+void cc_xas_try_split(struct cc_xa_state *xas, void *entry, unsigned int order);
+unsigned int cc_xas_try_split_min_order(unsigned int order);
 #else
 static inline int cc_xa_get_order(struct cc_xarray *xa, unsigned long index)
 {
@@ -1681,6 +1704,22 @@ static inline void cc_xas_split(struct cc_xa_state *xas, void *entry,
 static inline void cc_xas_split_alloc(struct cc_xa_state *xas, void *entry,
 		unsigned int order, gfp_t gfp)
 {
+}
+
+/* As upstream: without multi-index entries there is nothing to split. */
+static inline int cc_xas_get_order(struct cc_xa_state *xas)
+{
+	return 0;
+}
+
+static inline void cc_xas_try_split(struct cc_xa_state *xas, void *entry,
+		unsigned int order)
+{
+}
+
+static inline unsigned int cc_xas_try_split_min_order(unsigned int order)
+{
+	return 0;
 }
 #endif
 
