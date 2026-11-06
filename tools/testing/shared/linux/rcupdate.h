@@ -3,7 +3,9 @@
 #define _RCUPDATE_H
 
 #include <urcu.h>
+#include <linux/compiler.h>
 
+#define rcu_access_pointer(p) READ_ONCE(p)
 #define rcu_dereference_raw(p) rcu_dereference(p)
 #define rcu_dereference_protected(p, cond) rcu_dereference(p)
 #define rcu_dereference_check(p, cond) rcu_dereference(p)

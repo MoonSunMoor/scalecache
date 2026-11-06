@@ -464,7 +464,6 @@ struct mapping_metadata_bhs {
  * @i_mmap: Tree of private and shared mappings.
  * @i_mmap_rwsem: Protects @i_mmap and @i_mmap_writable.
  * @nrpages: Number of page entries.
- * @nrexceptional: ScaleCache exceptional-entry counter.
  * @nr_lock: Serializes generic page-cache and DAX counter updates; dedicated
  *   shmem updates retain their i_pages locking.  Nested inside i_pages or inode
  *   locks with IRQs disabled; never acquire those outer locks while holding it.
@@ -482,9 +481,6 @@ struct address_space {
 	atomic_t		i_mmap_writable;
 	struct rb_root_cached	i_mmap;
 	unsigned long		nrpages;
-
-	unsigned long		nrexceptional;
-
 	spinlock_t		nr_lock;
 	pgoff_t			writeback_index;
 	const struct address_space_operations *a_ops;

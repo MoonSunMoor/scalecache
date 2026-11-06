@@ -656,36 +656,24 @@ void workingset_update_node(struct xa_node *node)
 void cc_workingset_update_node(struct cc_xa_node *node)
 {
 	struct page *page = virt_to_page(node);
+	unsigned long flags;
 
 	/*
-	 * Track non-empty nodes that contain only shadow entries;
-	 * unlink those that contain pages or are being freed.
-	 *
-	 * This retains the original i_pages lock assertion and unlocked
-	 * list_empty() checks. Original cc filemap insertion does not take
-	 * i_pages.xa_lock, so that path violates this assertion and does not
-	 * serialize these checks against concurrent updates or reclaim.
-	 * The port preserves that pre-existing locking mismatch.
+	 * CC writers do not hold i_pages.xa_lock. The node lock serializes
+	 * the count/value snapshot and membership with other writers and
+	 * the CC shrinker. The order is node lock -> shadow_nodes LRU lock.
+	 * Callers must drop the node lock before invoking this callback.
 	 */
-	lockdep_assert_held(&node->array->xa_lock);
-
-	while (__atomic_load_n(&node->gc_flag, __ATOMIC_SEQ_CST))
-		cpu_relax();
-
-	if (__atomic_load_n(&node->del, __ATOMIC_SEQ_CST))
-		return;
-
-	if (node->count && node->count == node->nr_values) {
-		if (list_empty(&node->private_list)) {
-			list_lru_add_obj(&shadow_nodes, &node->private_list);
+	spin_lock_irqsave(&node->cc_lock, flags);
+	if (!node->del && node->gc_flag != CC_XA_GC_RETIRED &&
+	    node->count && node->count == node->nr_values) {
+		if (list_lru_add_obj(&shadow_nodes, &node->private_list))
 			__inc_node_page_state(page, WORKINGSET_NODES);
-		}
 	} else {
-		if (!list_empty(&node->private_list)) {
-			list_lru_del_obj(&shadow_nodes, &node->private_list);
+		if (list_lru_del_obj(&shadow_nodes, &node->private_list))
 			__dec_node_page_state(page, WORKINGSET_NODES);
-		}
 	}
+	spin_unlock_irqrestore(&node->cc_lock, flags);
 }
 
 static unsigned long count_shadow_nodes(struct shrinker *shrinker,
@@ -747,6 +735,91 @@ static unsigned long count_shadow_nodes(struct shrinker *shrinker,
 	return nodes - max_nodes;
 }
 
+/* Enter with the LRU, mapping xa_lock and optional inode lock held. */
+static enum lru_status cc_shadow_lru_isolate(struct cc_xa_node *node,
+		struct list_lru_one *lru, struct address_space *mapping)
+{
+	struct cc_xa_node *parent = NULL;
+	void __rcu **slot;
+	unsigned int i;
+	enum lru_status ret = LRU_REMOVED_RETRY;
+
+	if (!spin_trylock(&node->cc_lock))
+		goto skip;
+	if (node->gc_flag || node->del || !node->count ||
+	    node->count != node->nr_values)
+		goto unlock_node;
+	rcu_read_lock();
+	/* A logically deleted child still occupies a physical slot. */
+	for (i = 0; i < CC_XA_CHUNK_SIZE; i++) {
+		if (cc_xa_is_node(rcu_dereference_raw(node->slots[i]))) {
+			spin_unlock(&node->cc_lock);
+			spin_unlock(&lru->lock);
+			cc_xa_garbage_collector(CC_XARRAY(&mapping->i_pages),
+						cc_workingset_update_node);
+			ret = LRU_RETRY;
+			goto finish;
+		}
+	}
+	parent = rcu_dereference_raw(node->parent);
+	if (parent) {
+		if (cc_xa_pin_node(parent)) {
+			parent = NULL;
+			goto unlock_rcu;
+		}
+		if (!spin_trylock(&parent->cc_lock))
+			goto put_parent;
+	}
+	slot = parent ? &parent->slots[node->offset] :
+		&CC_XARRAY(&mapping->i_pages)->xa_head;
+	if (rcu_access_pointer(*slot) != cc_xa_mk_node(node) ||
+	    !__sync_bool_compare_and_swap(&node->refcnt, 0, CC_XA_REF_RETIRED))
+		goto unlock_parent;
+	node->gc_flag = CC_XA_GC_RETIRED;
+	node->del = 1;
+	RCU_INIT_POINTER(*slot, NULL);
+	if (parent) {
+		__sync_fetch_and_sub(&parent->count, 1);
+		spin_unlock(&parent->cc_lock);
+	}
+	list_lru_isolate(lru, &node->private_list);
+	__dec_node_page_state(virt_to_page(node), WORKINGSET_NODES);
+	spin_unlock(&node->cc_lock);
+	spin_unlock(&lru->lock);
+	/* Never re-enter the LRU callback under its list lock. */
+	if (parent) {
+		cc_workingset_update_node(parent);
+		__sync_fetch_and_sub(&parent->refcnt, 1);
+	}
+	mod_lruvec_kmem_state(node, WORKINGSET_NODERECLAIM, 1);
+	cc_xa_reclaim_node(node);
+finish:
+	rcu_read_unlock();
+	xa_unlock_irq(&mapping->i_pages);
+	if (mapping->host) {
+		if (mapping_shrinkable(mapping))
+			inode_lru_list_add(mapping->host);
+		spin_unlock(&mapping->host->i_lock);
+	}
+	cond_resched();
+	return ret;
+unlock_parent:
+	if (parent)
+		spin_unlock(&parent->cc_lock);
+put_parent:
+	if (parent)
+		__sync_fetch_and_sub(&parent->refcnt, 1);
+unlock_rcu:
+	rcu_read_unlock();
+unlock_node:
+	spin_unlock(&node->cc_lock);
+skip:
+	if (mapping->host)
+		spin_unlock(&mapping->host->i_lock);
+	xa_unlock(&mapping->i_pages);
+	return LRU_SKIP;
+}
+
 static enum lru_status shadow_lru_isolate(struct list_head *item,
 					  struct list_lru_one *lru,
 					  void *arg) __must_hold(lru->lock)
@@ -785,6 +858,9 @@ static enum lru_status shadow_lru_isolate(struct list_head *item,
 			goto out;
 		}
 	}
+
+	if (cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages)))
+		return cc_shadow_lru_isolate((struct cc_xa_node *)node, lru, mapping);
 
 	list_lru_isolate(lru, item);
 	__dec_node_page_state(virt_to_page(node), WORKINGSET_NODES);

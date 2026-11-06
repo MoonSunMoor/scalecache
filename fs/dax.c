@@ -1261,16 +1261,11 @@ int dax_writeback_mapping_range(struct address_space *mapping,
 	void *entry;
 	int ret = 0;
 	unsigned int scanned = 0;
-	unsigned long nrexceptional, flags;
 
 	if (WARN_ON_ONCE(inode->i_blkbits != PAGE_SHIFT))
 		return -EIO;
 
-	spin_lock_irqsave(&mapping->nr_lock, flags);
-	nrexceptional = mapping->nrexceptional;
-	spin_unlock_irqrestore(&mapping->nr_lock, flags);
-
-	if (!nrexceptional || mapping_empty(mapping) || wbc->sync_mode != WB_SYNC_ALL)
+	if (mapping_empty(mapping) || wbc->sync_mode != WB_SYNC_ALL)
 		return 0;
 
 	trace_dax_writeback_range(inode, xas.xa_index, end_index);

@@ -1573,6 +1573,7 @@ radix_tree_node_ctor(void *arg)
 
 	memset(node, 0, sizeof(*node));
 	INIT_LIST_HEAD(&node->private_list);
+	spin_lock_init(&node->cc_lock);
 }
 
 static int radix_tree_cpu_dead(unsigned int cpu)

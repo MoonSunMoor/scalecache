@@ -1964,7 +1964,6 @@ struct folio *__filemap_get_folio_mpol(struct address_space *mapping,
 		pgoff_t index, fgf_t fgp_flags, gfp_t gfp, struct mempolicy *policy)
 {
 	struct folio *folio;
-	unsigned long flags;
 
 repeat:
 	folio = filemap_get_entry(mapping, index);

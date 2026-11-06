@@ -1174,6 +1174,7 @@ struct xa_node {
 	unsigned char	gc_flag;	/* Under deleting */
 	unsigned char	del;		/* logically deleted */
 	unsigned short	refcnt;		/* Referencing users */
+	spinlock_t	cc_lock;	/* CC counters, shadow LRU and retirement */
 
 	struct xa_node __rcu *parent;	/* NULL at top of tree */
 	struct xarray	*array;		/* The array we belong to */

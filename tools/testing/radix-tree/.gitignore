@@ -8,5 +8,6 @@ main
 multiorder
 radix-tree.c
 xarray
+cc-xarray
 maple
 ma_xa_benchmark

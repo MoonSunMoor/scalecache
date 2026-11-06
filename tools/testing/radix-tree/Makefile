@@ -2,7 +2,7 @@
 
 .PHONY: clean
 
-TARGETS = main idr-test multiorder xarray maple
+TARGETS = main idr-test multiorder xarray maple cc-xarray
 CORE_OFILES = $(SHARED_OFILES) xarray.o maple.o test.o
 OFILES = main.o $(CORE_OFILES) regression1.o regression2.o \
 	 regression3.o regression4.o tag_check.o multiorder.o idr-test.o \
@@ -19,6 +19,13 @@ idr-test.o: ../../../lib/test_ida.c
 idr-test: idr-test.o $(CORE_OFILES)
 
 xarray: $(CORE_OFILES) xarray.o
+
+# Use SHIFT=6 for production-sized 6->0 and 7->1 split boundaries.
+# Run make clean before changing SHIFT; targets share node-cache objects.
+cc-xarray: cc-xarray.o cc-xarray-shared.o $(SHARED_OFILES)
+cc-xarray.o cc-xarray-shared.o: $(SHARED_DEPS) \
+	../../../include/linux/cc_xarray.h ../shared/linux/cc_xarray.h
+cc-xarray-shared.o: ../../../lib/cc_xarray.c
 
 maple: $(CORE_OFILES) maple.o
 

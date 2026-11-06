@@ -9,11 +9,13 @@
  *
  * See Documentation/core-api/xarray.rst for how to use the XArray.
  *
- * This API retains ScaleCache's node-reference and reclamation model, not
- * the regular XArray's RCU reclamation guarantee.  Advanced callers must
- * release their cursor with cc_xas_clear_xa_node() and unwind any retained
- * traversal references with cc_xas_rewind_refcnt().  Garbage collection
- * and destruction free nodes synchronously and require quiescent users.
+ * Acquire advanced cursor pins under RCU; a successful pin remains valid
+ * outside the read-side section until cc_xas_clear_xa_node(). Unwind retained
+ * traversal references with cc_xas_rewind_refcnt(). Retirement requires zero
+ * pins and physical freeing waits for RCU. GC permits concurrent single-slot
+ * writers and readers; destruction and subtree replacement exclude all users.
+ * Pin exhaustion reports -EOVERFLOW in the advanced state without changing
+ * the entry or reference count. Public RCU reads do not consume cursor pins.
  * Splitting requires exclusion of concurrent writers and garbage
  * collection; taking xa_lock does not serialize lockless cc_xas_store().
  */
@@ -1107,9 +1109,8 @@ static inline void cc_xa_release(struct cc_xarray *xa, unsigned long index)
  * itself so that we can walk the tree based purely on shifts and masks.
  * Generally, the larger the better; as the number of slots per level of the
  * tree increases, the less tall the tree needs to be.  But that needs to be
- * balanced against the memory consumption of each node.  On a 64-bit system,
- * cc_xa_node is currently 576 bytes, and we get 7 of them per 4kB page.  If we
- * doubled the number of slots per node, we'd get only 3 nodes per 4kB page.
+ * balanced against the memory consumption of each node. The node layout
+ * matches struct xa_node, including its debug-dependent lock storage.
  */
 #ifndef CC_XA_CHUNK_SHIFT
 #define CC_XA_CHUNK_SHIFT		(IS_ENABLED(CONFIG_BASE_SMALL) ? 4 : 6)
@@ -1119,10 +1120,13 @@ static inline void cc_xa_release(struct cc_xarray *xa, unsigned long index)
 #define CC_XA_MAX_MARKS		3
 #define CC_XA_MARK_LONGS		BITS_TO_LONGS(CC_XA_CHUNK_SIZE)
 
+#define CC_XA_GC_RETIRED 2
+#define CC_XA_REF_RETIRED USHRT_MAX
+
 /*
- * @count is the count of every non-NULL element in the ->slots array
- * whether that is a value entry, a retry entry, a user pointer,
- * a sibling entry or a pointer to the next level of the tree.
+ * @count counts live slots: values, pointers, siblings and active child nodes.
+ * A logically deleted child is excluded even while its physical pointer stays
+ * linked until GC visits it in postorder.
  * @nr_values is the count of every element in ->slots which is
  * either a value entry or a sibling of a value entry.
  */
@@ -1134,6 +1138,7 @@ struct cc_xa_node {
 	unsigned char	gc_flag;	/* Under deleting */
 	unsigned char	del;		/* Logically deleted */
 	unsigned short	refcnt;		/* Referencing users */
+	spinlock_t	cc_lock;	/* Counters, shadow LRU and retirement */
 	struct cc_xa_node __rcu *parent;	/* NULL at top of tree */
 	struct cc_xarray	*array;		/* The array we belong to */
 	union {
@@ -1149,8 +1154,6 @@ struct cc_xa_node {
 
 void cc_xa_dump(const struct cc_xarray *);
 void cc_xa_dump_node(const struct cc_xa_node *);
-
-void cc_xa_garbage_collector(struct cc_xarray *xa);
 
 #define CC_XA_DEBUG
 #ifdef CC_XA_DEBUG
@@ -1300,18 +1303,22 @@ static inline bool cc_xa_is_advanced(const void *entry)
 }
 
 /**
- * typedef xa_update_node_t - A callback function from the XArray.
+ * typedef cc_xa_update_node_t - A callback function from the Concurrent XArray.
  * @node: The node which is being processed
  *
  * This function is called every time the XArray updates the count of
  * present and value entries in a node.  It allows advanced users to
  * maintain the private_list in the node.
  *
- * Context: The xa_lock is held and interrupts may be disabled.
- *	    Implementations should not drop the xa_lock, nor re-enable
- *	    interrupts.
+ * Context: May run without xa_lock and with interrupts disabled. The caller
+ * releases node->cc_lock before calling; callbacks must serialize their own
+ * node bookkeeping and must not sleep or enable interrupts.
  */
 typedef void (*cc_xa_update_node_t)(struct cc_xa_node *node);
+
+void cc_xa_garbage_collector(struct cc_xarray *, cc_xa_update_node_t);
+/* Private workingset interface: node is unlinked, off-LRU and retired. */
+void cc_xa_reclaim_node(struct cc_xa_node *node);
 
 /*
  * The cc_xa_state is opaque to its users.  It contains various different pieces
@@ -1343,6 +1350,7 @@ struct cc_xa_state {
 	};
 	struct cc_xa_node *xa_alloc;
 	cc_xa_update_node_t xa_update;
+	struct list_lru *xa_lru;
 	struct cc_xa_node *trace_root;	/* Node trace root */
 	struct cc_xa_node *trace_leaf;	/* Node trace leaf */
 	int nr_refget;			/* Counter for get_node */
@@ -1366,6 +1374,7 @@ struct cc_xa_state {
 	.xa_node = CC_XAS_RESTART,				\
 	.xa_alloc = NULL,					\
 	.xa_update = NULL,					\
+	.xa_lru = NULL,						\
 	.trace_root = NULL,					\
 	.trace_leaf = NULL,					\
 	.nr_refget = 0,						\
@@ -1429,20 +1438,42 @@ cc_xa_put_node(struct cc_xa_state *xas, struct cc_xa_node *node)
 	if (xas->trace_root == node) {
 		xas->trace_root = NULL;
 		xas->trace_leaf = NULL;
+	} else if (xas->trace_leaf == node) {
+		xas->trace_leaf = cc_xa_parent(xas->xa, node);
 	}
 	return refcnt-1;
+}
+
+/* RCU protects the pointer until this pin succeeds. Retirement is 0 -> sentinel. */
+static inline int cc_xa_pin_node(struct cc_xa_node *node)
+{
+	unsigned short refs = __atomic_load_n(&node->refcnt, __ATOMIC_SEQ_CST);
+
+	for (;;) {
+		unsigned short old;
+
+		if (refs == CC_XA_REF_RETIRED)
+			return -EAGAIN;
+		if (refs == CC_XA_REF_RETIRED - 1)
+			return -EOVERFLOW;
+		old = __sync_val_compare_and_swap(&node->refcnt, refs, refs + 1);
+		if (old == refs)
+			return 0;
+		refs = old;
+	}
 }
 
 /* Private */
 static inline struct cc_xa_node *
 cc_xa_get_node(struct cc_xa_state *xas, struct cc_xa_node *node)
 {
-	int refcnt;
+	int err;
 
 	if (cc_xas_not_node(node))
 		return node;
-	refcnt = __sync_fetch_and_add(&node->refcnt, 1);
-	CC_XA_NODE_WARN_ON(node, refcnt == USHRT_MAX, "refcount++ OVERFLOW!!");
+	err = cc_xa_pin_node(node);
+	if (err)
+		return err == -EAGAIN ? NULL : CC_XA_ERROR(err);
 
 	/* Set node trace root */
 	if (!xas->trace_root)
@@ -1463,7 +1494,7 @@ static inline int cc_xas_error(const struct cc_xa_state *xas)
 	return cc_xa_err(xas->xa_node);
 }
 
-static inline void cc_xas_set_xa_node(struct cc_xa_state *xas, struct cc_xa_node *node);
+static inline bool cc_xas_set_xa_node(struct cc_xa_state *xas, struct cc_xa_node *node);
 
 /**
  * cc_xas_set_err() - Note an error in the cc_xa_state.
@@ -1520,18 +1551,20 @@ static inline bool cc_xas_not_node(const struct cc_xa_node *node)
 }
 
 /* Set xas.xa_node and increase refcnt, after decreasing old xa_node refcnt */
-static inline void
+static inline bool
 cc_xas_set_xa_node(struct cc_xa_state *xas, struct cc_xa_node *node)
 {
 	struct cc_xa_node *old = xas->xa_node;
 	int refcnt = -1;
+	int err = 0;
 
 	if (old == node)
-		return;
+		return true;
 
 	if (!cc_xas_not_node(node)) {
-		refcnt = __sync_fetch_and_add(&node->refcnt, 1);
-		CC_XA_NODE_WARN_ON(node, refcnt == USHRT_MAX, "refcount++ OVERFLOW!!");
+		err = cc_xa_pin_node(node);
+		if (err)
+			node = CC_XA_ERROR(err);
 	}
 
 	xas->__xa_node = node;
@@ -1539,6 +1572,7 @@ cc_xas_set_xa_node(struct cc_xa_state *xas, struct cc_xa_node *node)
 		refcnt = __sync_fetch_and_sub(&old->refcnt, 1);
 		CC_XA_NODE_WARN_ON(node, refcnt == 0, "refcount-- OVERFLOW!!");
 	}
+	return !err;
 }
 
 /* Revert node's refcnt in the node_trace list and remove from the list */
@@ -1650,8 +1684,6 @@ static inline void cc_xas_split_alloc(struct cc_xa_state *xas, void *entry,
 }
 #endif
 
-void cc_xa_garbage_collector(struct cc_xarray *xa);
-
 /**
  * cc_xas_reload() - Refetch an entry from the cc_xarray.
  * @xas: XArray operation state.
@@ -1733,10 +1765,26 @@ static inline void cc_xas_set_update(struct cc_xa_state *xas, cc_xa_update_node_
 	xas->xa_update = update;
 }
 
+/**
+ * cc_xas_set_lru() - Set the LRU used for node allocation.
+ * @xas: XArray operation state.
+ * @lru: LRU whose per-memcg storage must exist before nodes join it.
+ *
+ * Set this before allocating nodes when the update callback adds them to a
+ * memcg-aware LRU. The setting survives allocation retries and cursor resets.
+ */
+static inline void cc_xas_set_lru(struct cc_xa_state *xas, struct list_lru *lru)
+{
+	xas->xa_lru = lru;
+}
+
 void cc_workingset_update_node(struct cc_xa_node *node);
+extern struct list_lru shadow_nodes;
 #define cc_mapping_set_update(xas, mapping) do {			\
-	if (!dax_mapping(mapping) && !shmem_mapping(mapping))		\
+	if (!dax_mapping(mapping) && !shmem_mapping(mapping)) {	\
 		cc_xas_set_update(xas, cc_workingset_update_node);	\
+		cc_xas_set_lru(xas, &shadow_nodes);		\
+	}							\
 } while (0)
 
 /**
