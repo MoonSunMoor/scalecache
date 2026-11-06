@@ -318,6 +318,79 @@ void cc_xa_reclaim_node(struct cc_xa_node *node)
 	cc_xa_node_free(node);
 }
 
+/* Parent locks stay held; every inverse acquisition is a trylock. */
+static bool cc_xa_reclaim_empty_child(struct cc_xa_node *parent,
+		unsigned int offset, unsigned int *budget)
+{
+	struct cc_xa_node *node = cc_xa_to_node(
+			rcu_dereference_raw(parent->slots[offset]));
+	unsigned int i;
+	bool empty = true;
+
+	if (!*budget)
+		return false;
+	--*budget;
+	if (!spin_trylock(&node->cc_lock))
+		return false;
+	/* Only tombstones are already excluded from the parent's count. */
+	if (!node->del || node->count || node->gc_flag ||
+	    !list_empty(&node->private_list) ||
+	    rcu_access_pointer(node->parent) != parent)
+		goto unlock;
+	for (i = 0; i < CC_XA_CHUNK_SIZE; i++) {
+		void *entry = rcu_dereference_raw(node->slots[i]);
+
+		if (!entry)
+			continue;
+		if (!cc_xa_is_node(entry) ||
+		    !cc_xa_reclaim_empty_child(node, i, budget))
+			empty = false;
+	}
+	if (!empty || !cc_xa_try_retire_node(node))
+		goto unlock;
+	RCU_INIT_POINTER(parent->slots[offset], NULL);
+	spin_unlock(&node->cc_lock);
+	/* No count/membership change: neither node needs an update callback. */
+	cc_xa_node_free(node);
+	return true;
+unlock:
+	spin_unlock(&node->cc_lock);
+	return false;
+}
+
+/**
+ * cc_xa_reclaim_empty_children() - Bounded workingset tombstone cleanup.
+ * @node: Shadow-LRU candidate whose node lock remains held throughout.
+ *
+ * The caller holds RCU, the mapping xa_lock, its shadow-LRU lock and the
+ * inode lock if present. Only already logically deleted, empty, off-LRU
+ * children are traversed. At most CC_XA_CHUNK_SIZE descendant nodes and
+ * CC_XA_CHUNK_SIZE slots per visited node are inspected. Postorder removal
+ * makes progress through nested tombstones without scanning another subtree.
+ * Busy nodes and an exhausted budget leave the remaining links intact.
+ *
+ * No callback is invoked and no LRU link or logical parent count changes.
+ * Unpinned nodes are retired before unlinking and freed through RCU. All
+ * descendant locks are trylocks; the caller retains its locks and iterator.
+ * This is a private workingset interface, not a full-array GC replacement.
+ *
+ * Return: true if no physical child nodes remain; false otherwise, even if
+ * some descendants were reclaimed. A false result permits LRU_SKIP without
+ * dropping/reacquiring the LRU lock.
+ */
+bool cc_xa_reclaim_empty_children(struct cc_xa_node *node)
+{
+	unsigned int budget = CC_XA_CHUNK_SIZE;
+	unsigned int i;
+	bool empty = true;
+
+	for (i = 0; i < CC_XA_CHUNK_SIZE; i++)
+		if (cc_xa_is_node(rcu_dereference_raw(node->slots[i])) &&
+		    !cc_xa_reclaim_empty_child(node, i, &budget))
+			empty = false;
+	return empty;
+}
+
 /*
  * cc_xas_destroy() - Free any resources allocated during the XArray operation.
  * @xas: XArray operation state.
@@ -593,7 +666,7 @@ static void cc_xas_delete_node(struct cc_xa_state *xas)
 		/* Check if there are other threads in the parent node */
 		if (__atomic_load_n(&node->parent->refcnt, __ATOMIC_SEQ_CST) > 1) {
 			CC_XA_NODE_BUG_ON(node, !__sync_bool_compare_and_swap(&node->gc_flag, 1, 0));
-			if (!cc_xas_set_xa_node(xas, node) && cc_xas_error(xas) == -EBUSY)
+			if (!cc_xas_set_xa_node(xas, node))
 				cc_xas_set_xa_node(xas, CC_XAS_RESTART);
 			break;
 		}
@@ -601,7 +674,7 @@ static void cc_xas_delete_node(struct cc_xa_state *xas)
 		/* Check if there are other threads in the @node */
 		if (__atomic_load_n(&node->refcnt, __ATOMIC_SEQ_CST) > 1) {
 			CC_XA_NODE_BUG_ON(node, !__sync_bool_compare_and_swap(&node->gc_flag, 1, 0));
-			if (!cc_xas_set_xa_node(xas, node) && cc_xas_error(xas) == -EBUSY)
+			if (!cc_xas_set_xa_node(xas, node))
 				cc_xas_set_xa_node(xas, CC_XAS_RESTART);
 			break;
 		}
@@ -611,8 +684,7 @@ static void cc_xas_delete_node(struct cc_xa_state *xas)
 		if (!cc_xas_set_xa_node(xas, parent)) {
 			__atomic_store_n(&node->gc_flag, 0, __ATOMIC_SEQ_CST);
 			/* The erase is committed; an empty linked child can wait for GC. */
-			if (cc_xas_error(xas) == -EBUSY)
-				cc_xas_set_xa_node(xas, CC_XAS_RESTART);
+			cc_xas_set_xa_node(xas, CC_XAS_RESTART);
 			return;
 		}
 		xas->xa_offset = node->offset;
@@ -1006,6 +1078,11 @@ static void update_node(struct cc_xa_state *xas, struct cc_xa_node *node,
  * may be %NULL, even if there are non-NULL entries at some of the indices
  * covered by the range).  This is not a problem for any current users,
  * and can be changed if needed.
+ *
+ * Once an erase has committed, optional empty-node cleanup cannot turn it
+ * into a retry or an error: failed re-pins leave a restart cursor and the
+ * original old entry is returned. Errors before the slot change remain
+ * errors; callers must not treat them as successful erases.
  *
  * Return: The old entry at this index.
  */
@@ -2048,10 +2125,9 @@ static void cc_xa_garbage_collect_entry(struct cc_xarray *xa, void *entry,
 	slot = parent ? &parent->slots[node->offset] : &xa->xa_head;
 	if (rcu_access_pointer(*slot) != entry)
 		goto unlock_parent;
-	if (!__sync_bool_compare_and_swap(&node->refcnt, 0, CC_XA_REF_RETIRED))
+	if (!cc_xa_try_retire_node(node))
 		goto unlock_parent;
 	counted = !node->del;
-	node->gc_flag = CC_XA_GC_RETIRED;
 	node->del = 1;
 	RCU_INIT_POINTER(*slot, NULL);
 	if (parent) {

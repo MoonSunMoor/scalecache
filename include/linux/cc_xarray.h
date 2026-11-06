@@ -7,7 +7,8 @@
  * Copyright (c) 2017 Microsoft Corporation
  * Original Author: Matthew Wilcox <willy@infradead.org>
  *
- * See Documentation/core-api/xarray.rst for how to use the XArray.
+ * See Documentation/core-api/cc-xarray.rst for CC migration contracts and
+ * Documentation/core-api/xarray.rst for the underlying XArray API.
  *
  * Acquire advanced cursor pins under RCU; a successful pin remains valid
  * outside the read-side section until cc_xas_clear_xa_node(). Unwind retained
@@ -22,6 +23,8 @@
  * or competing pin. Advanced operations encountering that gate return
  * -EBUSY before using the new pin. Drop cursors/locks and restart the full
  * conflict scan on either error; an ENOMEM-only filemap retry is insufficient.
+ * Once an erase commits, optional cleanup re-pin failure leaves RESTART,
+ * not an error or a replay of that erase. Pre-commit failures are unchanged.
  */
 
 #include <linux/bitmap.h>
@@ -1317,11 +1320,19 @@ static inline bool cc_xa_is_advanced(const void *entry)
  *
  * Context: May run without xa_lock and with interrupts disabled. The caller
  * releases node->cc_lock before calling; callbacks must serialize their own
- * node bookkeeping and must not sleep or enable interrupts.
+ * node bookkeeping and must not sleep, enable interrupts or mutate the array.
  */
 typedef void (*cc_xa_update_node_t)(struct cc_xa_node *node);
 
-void cc_xa_garbage_collector(struct cc_xarray *, cc_xa_update_node_t);
+/* Tracked mappings pass cc_workingset_update_node; NULL is untracked only.
+ * Do not hold locks acquired by the callback (including the shadow-LRU lock).
+ */
+void cc_xa_garbage_collector(struct cc_xarray *xa, cc_xa_update_node_t update);
+/* Private workingset interface: RCU, node/xa/LRU/optional inode locks held.
+ * Bounded descendant cleanup; false keeps links and permits locked LRU_SKIP.
+ * No update callback or LRU membership change occurs inside this helper.
+ */
+bool cc_xa_reclaim_empty_children(struct cc_xa_node *node);
 /* Private workingset interface: node is unlinked, off-LRU and retired. */
 void cc_xa_reclaim_node(struct cc_xa_node *node);
 
@@ -1447,6 +1458,24 @@ cc_xa_put_node(struct cc_xa_state *xas, struct cc_xa_node *node)
 		xas->trace_leaf = cc_xa_parent(xas->xa, node);
 	}
 	return refcnt-1;
+}
+
+/*
+ * Private: caller holds node->cc_lock and has checked retirement eligibility.
+ * Logical deletion/reuse owns gc_flag == 1 even while its cursor is unpinned.
+ * Claim that ownership before retiring references; a plain flag check races
+ * with the deleter dropping its pin and must not allow GC to steal the flag.
+ */
+static inline bool cc_xa_try_retire_node(struct cc_xa_node *node)
+{
+	if (!__sync_bool_compare_and_swap(&node->gc_flag, 0, 1))
+		return false;
+	if (!__sync_bool_compare_and_swap(&node->refcnt, 0, CC_XA_REF_RETIRED)) {
+		__atomic_store_n(&node->gc_flag, 0, __ATOMIC_SEQ_CST);
+		return false;
+	}
+	__atomic_store_n(&node->gc_flag, CC_XA_GC_RETIRED, __ATOMIC_SEQ_CST);
+	return true;
 }
 
 /* RCU protects the pointer until this pin succeeds. Retirement is 0 -> sentinel. */

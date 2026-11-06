@@ -741,8 +741,6 @@ static enum lru_status cc_shadow_lru_isolate(struct cc_xa_node *node,
 {
 	struct cc_xa_node *parent = NULL;
 	void __rcu **slot;
-	unsigned int i;
-	enum lru_status ret = LRU_REMOVED_RETRY;
 
 	if (!spin_trylock(&node->cc_lock))
 		goto skip;
@@ -750,17 +748,9 @@ static enum lru_status cc_shadow_lru_isolate(struct cc_xa_node *node,
 	    node->count != node->nr_values)
 		goto unlock_node;
 	rcu_read_lock();
-	/* A logically deleted child still occupies a physical slot. */
-	for (i = 0; i < CC_XA_CHUNK_SIZE; i++) {
-		if (cc_xa_is_node(rcu_dereference_raw(node->slots[i]))) {
-			spin_unlock(&node->cc_lock);
-			spin_unlock(&lru->lock);
-			cc_xa_garbage_collector(CC_XARRAY(&mapping->i_pages),
-						cc_workingset_update_node);
-			ret = LRU_RETRY;
-			goto finish;
-		}
-	}
+	/* Keep the LRU lock and saved iterator valid if cleanup cannot finish. */
+	if (!cc_xa_reclaim_empty_children(node))
+		goto unlock_rcu;
 	parent = rcu_dereference_raw(node->parent);
 	if (parent) {
 		if (cc_xa_pin_node(parent)) {
@@ -773,9 +763,8 @@ static enum lru_status cc_shadow_lru_isolate(struct cc_xa_node *node,
 	slot = parent ? &parent->slots[node->offset] :
 		&CC_XARRAY(&mapping->i_pages)->xa_head;
 	if (rcu_access_pointer(*slot) != cc_xa_mk_node(node) ||
-	    !__sync_bool_compare_and_swap(&node->refcnt, 0, CC_XA_REF_RETIRED))
+	    !cc_xa_try_retire_node(node))
 		goto unlock_parent;
-	node->gc_flag = CC_XA_GC_RETIRED;
 	node->del = 1;
 	RCU_INIT_POINTER(*slot, NULL);
 	if (parent) {
@@ -793,7 +782,6 @@ static enum lru_status cc_shadow_lru_isolate(struct cc_xa_node *node,
 	}
 	mod_lruvec_kmem_state(node, WORKINGSET_NODERECLAIM, 1);
 	cc_xa_reclaim_node(node);
-finish:
 	rcu_read_unlock();
 	xa_unlock_irq(&mapping->i_pages);
 	if (mapping->host) {
@@ -802,7 +790,7 @@ finish:
 		spin_unlock(&mapping->host->i_lock);
 	}
 	cond_resched();
-	return ret;
+	return LRU_REMOVED_RETRY;
 unlock_parent:
 	if (parent)
 		spin_unlock(&parent->cc_lock);

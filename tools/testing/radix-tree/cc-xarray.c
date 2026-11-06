@@ -4,6 +4,8 @@
 #include "test.h"
 #include "radix-tree.h"
 #include <linux/cc_xarray.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -510,6 +512,114 @@ static void ref_boundaries(void)
 	finish(&xa, "ref-sentinel-error-propagation");
 }
 
+struct erase_race {
+	struct cc_xarray *xa;
+	struct cc_xa_node *leaf;
+	unsigned long index;
+	int start, armed, done, retired;
+};
+
+static struct erase_race *erase_probe;
+
+/* Synchronize via the real bookkeeping callback, not a product-code hook. */
+static void erase_updated(struct cc_xa_node *node)
+{
+	struct erase_race *race = erase_probe;
+
+	if (node != race->leaf || node->count)
+		return;
+	__atomic_store_n(&race->start, 1, __ATOMIC_RELEASE);
+	while (!__atomic_load_n(&race->armed, __ATOMIC_ACQUIRE))
+		cpu_relax();
+}
+
+static void erase_gc_updated(struct cc_xa_node *node)
+{
+	if (node == erase_probe->leaf && node->gc_flag == CC_XA_GC_RETIRED)
+		__atomic_store_n(&erase_probe->retired, 1, __ATOMIC_RELEASE);
+}
+
+static void *erase_gc_writer(void *arg)
+{
+	struct erase_race *race = arg;
+	unsigned int i;
+
+	rcu_register_thread();
+	while (!__atomic_load_n(&race->start, __ATOMIC_ACQUIRE))
+		sched_yield();
+	__atomic_store_n(&race->armed, 1, __ATOMIC_RELEASE);
+	for (i = 0; i < 64; i++) {
+		cc_xa_garbage_collector(race->xa, erase_gc_updated);
+		if (__atomic_load_n(&race->retired, __ATOMIC_ACQUIRE) ||
+		    __atomic_load_n(&race->done, __ATOMIC_ACQUIRE))
+			break;
+	}
+	/* A new writer starts only after retirement or the completed erase. */
+	while (!__atomic_load_n(&race->retired, __ATOMIC_ACQUIRE) &&
+	       !__atomic_load_n(&race->done, __ATOMIC_ACQUIRE))
+		sched_yield();
+	assert(!cc_xa_store(race->xa, race->index, cc_xa_mk_value(92), GFP_KERNEL));
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void erase_postcommit(void)
+{
+	unsigned int round, retired_before_return = 0;
+	const unsigned long index = CC_XA_CHUNK_SIZE + 1;
+	void *old_value = cc_xa_mk_value(91);
+
+	for (round = 0; round < 4096; round++) {
+		struct cc_xarray xa;
+		struct erase_race race = { .xa = &xa, .index = index };
+		pthread_t thread;
+		void *entry, *old;
+		int err;
+		CC_XA_STATE_ORDER(parent1, &xa, 0, 2 * CC_XA_CHUNK_SHIFT);
+		CC_XA_STATE_ORDER(parent2, &xa, 0, 2 * CC_XA_CHUNK_SHIFT);
+		CC_XA_STATE(cursor, &xa, index);
+
+		cc_xa_init(&xa);
+		assert(!cc_xa_store(&xa, index, old_value, GFP_KERNEL));
+		rcu_read_lock();
+		assert(cc_xa_is_node(cc_xas_load(&parent1, false)));
+		assert(cc_xa_is_node(cc_xas_load(&parent2, false)));
+		cc_xas_for_each(&cursor, entry, index) {
+			assert(entry == old_value);
+			break;
+		}
+		assert(entry == old_value && cc_xas_is_node(&cursor));
+		race.leaf = cursor.xa_node;
+		assert(race.leaf->refcnt == 1 && race.leaf->parent->refcnt == 2);
+		erase_probe = &race;
+		cc_xas_set_update(&cursor, erase_updated);
+		assert(!pthread_create(&thread, NULL, erase_gc_writer, &race));
+		old = cc_xas_store(&cursor, NULL);
+		err = cc_xas_error(&cursor);
+		retired_before_return += __atomic_load_n(&race.retired, __ATOMIC_ACQUIRE);
+		release_cursor(&cursor);
+		__atomic_store_n(&race.done, 1, __ATOMIC_RELEASE);
+		assert(!pthread_join(thread, NULL));
+		if (old != old_value || err || cc_xa_load(&xa, index) != cc_xa_mk_value(92))
+			printf("FAIL erase-postcommit round=%u old=%p expected=%p err=%d new=%p retired=%d\n",
+			       round, old, old_value, err, cc_xa_load(&xa, index), race.retired);
+		assert(old == old_value && !err);
+		assert(cc_xa_load(&xa, index) == cc_xa_mk_value(92));
+		release_cursor(&parent1);
+		release_cursor(&parent2);
+		rcu_read_unlock();
+		erase_probe = NULL;
+		if (cc_xa_is_node(xa.xa_head))
+			check_nodes(cc_xa_to_node(xa.xa_head));
+		cc_xa_destroy(&xa);
+		rcu_barrier();
+		assert(!kmem_cache_nr_allocated(radix_tree_node_cachep));
+		assert(!nr_allocated);
+	}
+	printf("PASS erase-postcommit rounds=%u retired_before_return=%u outstanding_nodes=%d\n",
+	       round, retired_before_return, nr_allocated);
+}
+
 int main(int argc, char **argv)
 {
 	const char *test = argc > 1 ? argv[1] : "all";
@@ -538,6 +648,8 @@ int main(int argc, char **argv)
 		try_split_insert();
 		try_split_conflict();
 	}
+	if (!strcmp(test, "all") || !strcmp(test, "erase-postcommit"))
+		erase_postcommit();
 	radix_tree_cpu_dead(1);
 	rcu_barrier();
 	assert(!nr_allocated);
