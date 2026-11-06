@@ -4451,13 +4451,6 @@ EXPORT_SYMBOL(cpuset_memory_pressure_enabled);
  * (direct) page reclaim by any task attached to the cpuset.
  */
 
-void __cpuset_memory_pressure_bump(void)
-{
-	rcu_read_lock();
-	fmeter_markevent(&task_cs(current)->fmeter);
-	rcu_read_unlock();
-}
-EXPORT_SYMBOL(__cpuset_memory_pressure_bump);
 
 #ifdef CONFIG_PROC_PID_CPUSET
 /*
