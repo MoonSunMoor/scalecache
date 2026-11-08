@@ -63,10 +63,11 @@ struct wb_writeback_work {
  */
 static unsigned int dirtytime_expire_interval = 12 * 60 * 60;
 
-static inline struct inode *wb_inode(struct list_head *head)
+inline struct inode *wb_inode(struct list_head *head)
 {
 	return list_entry(head, struct inode, i_io_list);
 }
+EXPORT_SYMBOL(wb_inode);
 
 /*
  * Include the creation of the trace points after defining the
@@ -129,13 +130,15 @@ static bool inode_io_list_move_locked(struct inode *inode,
 	return false;
 }
 
-static void wb_wakeup(struct bdi_writeback *wb)
+// static void wb_wakeup(struct bdi_writeback *wb)
+void wb_wakeup(struct bdi_writeback *wb)
 {
 	spin_lock_irq(&wb->work_lock);
 	if (test_bit(WB_registered, &wb->state))
 		mod_delayed_work(bdi_wq, &wb->dwork, 0);
 	spin_unlock_irq(&wb->work_lock);
 }
+EXPORT_SYMBOL(wb_wakeup);
 
 /*
  * This function is used when the first inode for this wb is marked dirty. It
@@ -151,7 +154,8 @@ static void wb_wakeup(struct bdi_writeback *wb)
  * We have to be careful not to postpone flush work if it is scheduled for
  * earlier. Thus we use queue_delayed_work().
  */
-static void wb_wakeup_delayed(struct bdi_writeback *wb)
+// static void wb_wakeup_delayed(struct bdi_writeback *wb)
+void wb_wakeup_delayed(struct bdi_writeback *wb)
 {
 	unsigned long timeout;
 
@@ -161,8 +165,9 @@ static void wb_wakeup_delayed(struct bdi_writeback *wb)
 		queue_delayed_work(bdi_wq, &wb->dwork, timeout);
 	spin_unlock_irq(&wb->work_lock);
 }
+EXPORT_SYMBOL(wb_wakeup_delayed);
 
-static void finish_writeback_work(struct wb_writeback_work *work)
+void finish_writeback_work(struct wb_writeback_work *work)
 {
 	struct wb_completion *done = work->done;
 
@@ -176,6 +181,7 @@ static void finish_writeback_work(struct wb_writeback_work *work)
 			wake_up_all(waitq);
 	}
 }
+EXPORT_SYMBOL(wb_wait_for_completion);
 
 static void wb_queue_work(struct bdi_writeback *wb,
 			  struct wb_writeback_work *work)
@@ -1047,7 +1053,8 @@ EXPORT_SYMBOL_GPL(wbc_account_cgroup_owner);
  * relation to the total write bandwidth of all wb's w/ dirty inodes on
  * @wb->bdi.
  */
-static long wb_split_bdi_pages(struct bdi_writeback *wb, long nr_pages)
+// static long wb_split_bdi_pages(struct bdi_writeback *wb, long nr_pages)
+long wb_split_bdi_pages(struct bdi_writeback *wb, long nr_pages)
 {
 	unsigned long this_bw = wb->avg_write_bandwidth;
 	unsigned long tot_bw = atomic_long_read(&wb->bdi->tot_write_bandwidth);
@@ -1065,6 +1072,7 @@ static long wb_split_bdi_pages(struct bdi_writeback *wb, long nr_pages)
 	else
 		return DIV_ROUND_UP_ULL((u64)nr_pages * this_bw, tot_bw);
 }
+EXPORT_SYMBOL(wb_split_bdi_pages);
 
 /**
  * bdi_split_work_to_wbs - split a wb_writeback_work to all wb's of a bdi
@@ -1330,11 +1338,13 @@ static inline void wbc_attach_and_unlock_inode(struct writeback_control *wbc,
  * Add in the number of potentially dirty inodes, because each inode
  * write can dirty pagecache in the underlying blockdev.
  */
-static unsigned long get_nr_dirty_pages(void)
+//static unsigned long get_nr_dirty_pages(void)
+unsigned long get_nr_dirty_pages(void)
 {
 	return global_node_page_state(NR_FILE_DIRTY) +
 		get_nr_dirty_inodes();
 }
+EXPORT_SYMBOL(get_nr_dirty_pages);
 
 static void wb_start_writeback(struct bdi_writeback *wb, enum wb_reason reason)
 {
@@ -1376,6 +1386,7 @@ void wb_start_background_writeback(struct bdi_writeback *wb)
 	trace_writeback_wake_background(wb);
 	wb_wakeup(wb);
 }
+EXPORT_SYMBOL(wb_start_background_writeback);
 
 /*
  * Remove the inode from the writeback list it is on.
@@ -1438,6 +1449,7 @@ void sb_clear_inode_writeback(struct inode *inode)
 		spin_unlock_irqrestore(&sb->s_inode_wblist_lock, flags);
 	}
 }
+EXPORT_SYMBOL(sb_clear_inode_writeback);
 
 /*
  * Redirty an inode: set its when-it-was dirtied timestamp and move it to the
@@ -1580,7 +1592,10 @@ out:
  *                                           |
  *                                           +--> dequeue for IO
  */
-static void queue_io(struct bdi_writeback *wb, struct wb_writeback_work *work,
+// static void queue_io(struct bdi_writeback *wb, struct wb_writeback_work *work,
+//		     unsigned long dirtied_before)
+
+void wb_queue_io(struct bdi_writeback *wb, struct wb_writeback_work *work,
 		     unsigned long dirtied_before)
 {
 	int moved;
@@ -1597,6 +1612,7 @@ static void queue_io(struct bdi_writeback *wb, struct wb_writeback_work *work,
 		wb_io_lists_populated(wb);
 	trace_writeback_queue_io(wb, work, dirtied_before, moved);
 }
+EXPORT_SYMBOL(wb_queue_io);
 
 static int write_inode(struct inode *inode, struct writeback_control *wbc)
 {
@@ -2181,7 +2197,7 @@ static long writeback_inodes_wb(struct bdi_writeback *wb, long nr_pages,
 	blk_start_plug(&plug);
 	spin_lock(&wb->list_lock);
 	if (list_empty(&wb->b_io))
-		queue_io(wb, &work, jiffies);
+		wb_queue_io(wb, &work, jiffies);
 	__writeback_inodes_wb(wb, &work);
 	spin_unlock(&wb->list_lock);
 	blk_finish_plug(&plug);
@@ -2257,7 +2273,7 @@ static long wb_writeback(struct bdi_writeback *wb,
 			} else if (work->for_background)
 				dirtied_before = jiffies;
 
-			queue_io(wb, work, dirtied_before);
+			wb_queue_io(wb, work, dirtied_before);
 			queued = true;
 		}
 		if (work->sb)
@@ -2339,7 +2355,7 @@ static long wb_check_background_flush(struct bdi_writeback *wb)
 	return 0;
 }
 
-static long wb_check_old_data_flush(struct bdi_writeback *wb)
+long wb_check_old_data_flush(struct bdi_writeback *wb)
 {
 	unsigned long expired;
 	long nr_pages;
@@ -2372,8 +2388,10 @@ static long wb_check_old_data_flush(struct bdi_writeback *wb)
 
 	return 0;
 }
+EXPORT_SYMBOL(wb_check_old_data_flush);
 
-static long wb_check_start_all(struct bdi_writeback *wb)
+// static long wb_check_start_all(struct bdi_writeback *wb)
+long wb_check_start_all(struct bdi_writeback *wb)
 {
 	long nr_pages;
 
@@ -2395,6 +2413,7 @@ static long wb_check_start_all(struct bdi_writeback *wb)
 	clear_bit(WB_start_all, &wb->state);
 	return nr_pages;
 }
+EXPORT_SYMBOL(wb_check_start_all);
 
 static long wb_check_start_dontcache(struct bdi_writeback *wb)
 {
@@ -2421,7 +2440,8 @@ static long wb_check_start_dontcache(struct bdi_writeback *wb)
 /*
  * Retrieve work items and do the writeback they describe
  */
-static long wb_do_writeback(struct bdi_writeback *wb)
+// static long wb_do_writeback(struct bdi_writeback *wb)
+long wb_do_writeback(struct bdi_writeback *wb)
 {
 	struct wb_writeback_work *work;
 	long wrote = 0;
@@ -2452,6 +2472,33 @@ static long wb_do_writeback(struct bdi_writeback *wb)
 
 	return wrote;
 }
+EXPORT_SYMBOL(wb_do_writeback);
+
+/*
+ * User thread do the writeback works they describe
+ */
+long wb_do_writeback_modified(struct bdi_writeback *wb)
+{
+        long wrote = 0;
+
+        if (!__sync_fetch_and_add(&wb->nr_threads, 1))
+                set_bit(WB_writeback_running, &wb->state);
+
+        //wrote += scext4_wb_check_start_all(wb);
+        wrote += wb_check_start_all(wb);
+
+        //wrote += scext4_wb_check_old_data_flush(wb);
+        wrote += wb_check_old_data_flush(wb);
+
+        wrote += wb_check_background_flush(wb);
+        //wrote += wb_check_background_flush(wb);
+
+        if (__sync_sub_and_fetch(&wb->nr_threads, 1))
+                clear_bit(WB_writeback_running, &wb->state);
+
+        return wrote;
+}
+EXPORT_SYMBOL(wb_do_writeback_modified);
 
 /*
  * Handle writeback of dirty data for the device backed by this bdi. Also
@@ -2516,6 +2563,7 @@ void wakeup_flusher_threads_bdi(struct backing_dev_info *bdi,
 	__wakeup_flusher_threads_bdi(bdi, reason);
 	rcu_read_unlock();
 }
+EXPORT_SYMBOL(wakeup_flusher_threads_bdi);
 
 /**
  * filemap_dontcache_kick_writeback - kick flusher for IOCB_DONTCACHE writes
@@ -2571,6 +2619,7 @@ void wakeup_flusher_threads(enum wb_reason reason)
 		__wakeup_flusher_threads_bdi(bdi, reason);
 	rcu_read_unlock();
 }
+EXPORT_SYMBOL(wakeup_flusher_threads);
 
 /*
  * Wake up bdi's periodically to make sure dirtytime inodes gets
