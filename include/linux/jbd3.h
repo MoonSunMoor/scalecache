@@ -21,22 +21,22 @@
 
 #include <linux/types.h>
 #include <linux/buffer_head.h>
-#include <linux/journal-head3.h>
+#include <linux/journal-head.h>
 #include <linux/stddef.h>
 #include <linux/mutex.h>
 #include <linux/timer.h>
 #include <linux/slab.h>
 #include <linux/bit_spinlock.h>
 #include <linux/blkdev.h>
-#include <crypto/hash.h>
+#include <linux/crc32c.h>
 #endif
 
 #define journal_oom_retry 1
 
 /*
- * Define JBD3_PARANIOD_IOFAIL to cause a kernel BUG() if pxt4 finds
+ * Define JBD3_PARANIOD_IOFAIL to cause a kernel BUG() if ext4 finds
  * certain classes of error which can occur due to failed IOs.  Under
- * normal use we want pxt4 to continue after such errors, because
+ * normal use we want ext4 to continue after such errors, because
  * hardware _can_ fail, but for debugging purposes when running tests on
  * known-good hardware we may want to trap these errors.
  */
@@ -62,9 +62,6 @@ void __jbd3_debug(int level, const char *file, const char *func,
 #else
 #define jbd3_debug(n, fmt, a...)  no_printk(fmt, ##a)
 #endif
-
-extern void *jbd3_alloc(size_t size, gfp_t flags);
-extern void jbd3_free(void *ptr, size_t size);
 
 #define JBD3_MIN_JOURNAL_BLOCKS 1024
 #define JBD3_DEFAULT_FAST_COMMIT_BLOCKS 256
@@ -429,21 +426,45 @@ struct jbd3_inode {
 	unsigned long i_flags;
 
 	/**
-	 * @i_dirty_start:
+	 * @i_dirty_start_page:
 	 *
-	 * Offset in bytes where the dirty range for this inode starts.
+	 * Dirty range start in PAGE_SIZE units.
+	 *
+	 * The dirty range is empty if @i_dirty_start_page is greater than or
+	 * equal to @i_dirty_end_page.
+	 *
 	 * [j_list_lock]
 	 */
-	loff_t i_dirty_start;
+	pgoff_t i_dirty_start_page;
 
 	/**
-	 * @i_dirty_end:
+	 * @i_dirty_end_page:
 	 *
-	 * Inclusive offset in bytes where the dirty range for this inode
-	 * ends. [j_list_lock]
+	 * Dirty range end in PAGE_SIZE units (exclusive).
+	 *
+	 * [j_list_lock]
 	 */
-	loff_t i_dirty_end;
+	pgoff_t i_dirty_end_page;
 };
+
+/*
+ * Lockless readers treat start_page >= end_page as an empty range.
+ * Writers publish a new non-empty range by storing i_dirty_end_page before
+ * i_dirty_start_page.
+ */
+static inline bool jbd3_jinode_get_dirty_range(const struct jbd3_inode *jinode,
+					       loff_t *start, loff_t *end)
+{
+	pgoff_t start_page = READ_ONCE(jinode->i_dirty_start_page);
+	pgoff_t end_page = READ_ONCE(jinode->i_dirty_end_page);
+
+	if (start_page >= end_page)
+		return false;
+
+	*start = (loff_t)start_page << PAGE_SHIFT;
+	*end = ((loff_t)end_page << PAGE_SHIFT) - 1;
+	return true;
+}
 
 struct jbd3_revoke_table_s;
 
@@ -459,7 +480,6 @@ struct jbd3_revoke_table_s;
  * @h_ref: Reference count on this handle.
  * @h_err: Field for caller's use to track errors through large fs operations.
  * @h_sync: Flag for sync-on-close.
- * @h_jdata: Flag to force data journaling.
  * @h_reserved: Flag for handle for reserved credits.
  * @h_aborted: Flag indicating fatal error on handle.
  * @h_type: For handle statistics.
@@ -491,7 +511,6 @@ struct jbd3_journal_handle
 
 	/* Flags [no locking] */
 	unsigned int	h_sync:		1;
-	unsigned int	h_jdata:	1;
 	unsigned int	h_reserved:	1;
 	unsigned int	h_aborted:	1;
 	unsigned int	h_type:		8;
@@ -623,7 +642,7 @@ struct transaction_s
 	struct journal_head	*t_shadow_list;
 
 	/*
-	 * List of inodes associated with the transaction; e.g., pxt4 uses
+	 * List of inodes associated with the transaction; e.g., ext4 uses
 	 * this to track inodes in data=ordered and data=journal mode that
 	 * need special handling on transaction commit; also used by ocfs2.
 	 * [j_list_lock]
@@ -700,12 +719,6 @@ struct transaction_s
 
 	/* Disk flush needs to be sent to fs partition [no locking] */
 	int			t_need_data_flush;
-
-	/*
-	 * For use by the filesystem to store fs-specific data
-	 * structures associated with the transaction
-	 */
-	struct list_head	t_private_list;
 };
 
 struct transaction_run_stats_s {
@@ -754,11 +767,6 @@ struct journal_s
 	 * no lock for quick racy checks]
 	 */
 	unsigned long		j_flags;
-
-	/**
-	 * @j_atomic_flags: Atomic journaling state flags.
-	 */
-	unsigned long		j_atomic_flags;
 
 	/**
 	 * @j_errno:
@@ -886,7 +894,7 @@ struct journal_s
 	 * Journal head shrinker, reclaim buffer's journal head which
 	 * has been written back.
 	 */
-	struct shrinker		j_shrinker;
+	struct shrinker		*j_shrinker;
 
 	/**
 	 * @j_checkpoint_jh_count:
@@ -999,6 +1007,13 @@ struct journal_s
 	struct block_device	*j_fs_dev;
 
 	/**
+	 * @j_fs_dev_wb_err:
+	 *
+	 * Records the errseq of the client fs's backing block device.
+	 */
+	errseq_t		j_fs_dev_wb_err;
+
+	/**
 	 * @j_total_len: Total maximum capacity of the journal region on disk.
 	 */
 	unsigned int		j_total_len;
@@ -1082,6 +1097,13 @@ struct journal_s
 	 * Number of revoke records that fit in one descriptor block.
 	 */
 	int			j_revoke_records_per_block;
+
+	/**
+	 * @j_transaction_overhead_buffers:
+	 *
+	 * Number of blocks each transaction needs for its own bookkeeping
+	 */
+	int			j_transaction_overhead_buffers;
 
 	/**
 	 * @j_commit_interval:
@@ -1233,13 +1255,6 @@ struct journal_s
 	void *j_private;
 
 	/**
-	 * @j_chksum_driver:
-	 *
-	 * Reference to checksum algorithm driver via cryptoapi.
-	 */
-	struct crypto_shash *j_chksum_driver;
-
-	/**
 	 * @j_csum_seed:
 	 *
 	 * Precomputed journal UUID checksum for seeding other checksums.
@@ -1259,6 +1274,12 @@ struct journal_s
 	 */
 	struct lockdep_map	j_trans_commit_map;
 #endif
+	/**
+	 * @jbd3_trans_commit_key:
+	 *
+	 * "struct lock_class_key" for @j_trans_commit_map
+	 */
+	struct lock_class_key	jbd3_trans_commit_key;
 
 	/**
 	 * @j_fc_cleanup_callback:
@@ -1374,6 +1395,9 @@ JBD3_FEATURE_INCOMPAT_FUNCS(csum2,		CSUM_V2)
 JBD3_FEATURE_INCOMPAT_FUNCS(csum3,		CSUM_V3)
 JBD3_FEATURE_INCOMPAT_FUNCS(fast_commit,	FAST_COMMIT)
 
+/* Journal high priority write IO operation flags */
+#define JBD3_JOURNAL_REQ_FLAGS		(REQ_META | REQ_SYNC | REQ_IDLE)
+
 /*
  * Journal flag definitions
  */
@@ -1383,9 +1407,6 @@ JBD3_FEATURE_INCOMPAT_FUNCS(fast_commit,	FAST_COMMIT)
 #define JBD3_FLUSHED	0x008	/* The journal superblock has been flushed */
 #define JBD3_LOADED	0x010	/* The journal superblock has been loaded */
 #define JBD3_BARRIER	0x020	/* Use IDE barriers */
-#define JBD3_ABORT_ON_SYNCDATA_ERR	0x040	/* Abort the journal on file
-						 * data write error in ordered
-						 * mode */
 #define JBD3_CYCLE_RECORD		0x080	/* Journal cycled record log on
 						 * clean and empty filesystem
 						 * logging area */
@@ -1397,18 +1418,11 @@ JBD3_FEATURE_INCOMPAT_FUNCS(fast_commit,	FAST_COMMIT)
 					JBD3_JOURNAL_FLUSH_ZEROOUT)
 
 /*
- * Journal atomic flag definitions
- */
-#define JBD3_CHECKPOINT_IO_ERROR	0x001	/* Detect io error while writing
-						 * buffer back to disk */
-
-/*
  * Function declarations for the journaling transaction and buffer
  * management
  */
 
 /* Filing buffers */
-extern void jbd3_journal_unfile_buffer(journal_t *, struct journal_head *);
 extern bool __jbd3_journal_refile_buffer(struct journal_head *);
 extern void jbd3_journal_refile_buffer(journal_t *, struct journal_head *);
 extern void __jbd3_journal_file_buffer(struct journal_head *, transaction_t *, int);
@@ -1435,7 +1449,9 @@ void jbd3_update_log_tail(journal_t *journal, tid_t tid, unsigned long block);
 extern void jbd3_journal_commit_transaction(journal_t *);
 
 /* Checkpoint list management */
-void __jbd3_journal_clean_checkpoint_list(journal_t *journal, bool destroy);
+enum jbd3_shrink_type {JBD3_SHRINK_DESTROY, JBD3_SHRINK_BUSY_STOP, JBD3_SHRINK_BUSY_SKIP};
+
+void __jbd3_journal_clean_checkpoint_list(journal_t *journal, enum jbd3_shrink_type type);
 unsigned long jbd3_journal_shrink_checkpoint_list(journal_t *journal, unsigned long *nr_to_scan);
 int __jbd3_journal_remove_checkpoint(struct journal_head *);
 int jbd3_journal_try_remove_checkpoint(struct journal_head *jh);
@@ -1587,10 +1603,13 @@ void jbd3_journal_put_journal_head(struct journal_head *jh);
  */
 extern struct kmem_cache *jbd3_handle_cache;
 
-static inline handle_t *jbd3_alloc_handle(gfp_t gfp_flags)
-{
-	return kmem_cache_zalloc(jbd3_handle_cache, gfp_flags);
-}
+/*
+ * This specialized allocator has to be a macro for its allocations to be
+ * accounted separately (to have a separate alloc_tag). The typecast is
+ * intentional to enforce typesafety.
+ */
+#define jbd3_alloc_handle(_gfp_flags)	\
+		((handle_t *)kmem_cache_zalloc(jbd3_handle_cache, _gfp_flags))
 
 static inline void jbd3_free_handle(handle_t *handle)
 {
@@ -1603,10 +1622,13 @@ static inline void jbd3_free_handle(handle_t *handle)
  */
 extern struct kmem_cache *jbd3_inode_cache;
 
-static inline struct jbd3_inode *jbd3_alloc_inode(gfp_t gfp_flags)
-{
-	return kmem_cache_alloc(jbd3_inode_cache, gfp_flags);
-}
+/*
+ * This specialized allocator has to be a macro for its allocations to be
+ * accounted separately (to have a separate alloc_tag). The typecast is
+ * intentional to enforce typesafety.
+ */
+#define jbd3_alloc_inode(_gfp_flags)	\
+		((struct jbd3_inode *)kmem_cache_alloc(jbd3_inode_cache, _gfp_flags))
 
 static inline void jbd3_free_inode(struct jbd3_inode *jinode)
 {
@@ -1620,10 +1642,12 @@ extern void	   jbd3_journal_destroy_revoke_record_cache(void);
 extern void	   jbd3_journal_destroy_revoke_table_cache(void);
 extern int __init jbd3_journal_init_revoke_record_cache(void);
 extern int __init jbd3_journal_init_revoke_table_cache(void);
+struct jbd3_revoke_table_s *jbd3_journal_init_revoke_table(int hash_size);
+void jbd3_journal_destroy_revoke_table(struct jbd3_revoke_table_s *table);
 
 extern void	   jbd3_journal_destroy_revoke(journal_t *);
 extern int	   jbd3_journal_revoke (handle_t *, unsigned long long, struct buffer_head *);
-extern int	   jbd3_journal_cancel_revoke(handle_t *, struct journal_head *);
+extern void	   jbd3_journal_cancel_revoke(handle_t *, struct journal_head *);
 extern void	   jbd3_journal_write_revoke_records(transaction_t *transaction,
 						     struct list_head *log_bufs);
 
@@ -1661,12 +1685,7 @@ int jbd3_fc_get_buf(journal_t *journal, struct buffer_head **bh_out);
 int jbd3_submit_inode_data(journal_t *journal, struct jbd3_inode *jinode);
 int jbd3_wait_inode_data(journal_t *journal, struct jbd3_inode *jinode);
 int jbd3_fc_wait_bufs(journal_t *journal, int num_blks);
-int jbd3_fc_release_bufs(journal_t *journal);
-
-static inline int jbd3_journal_get_max_txn_bufs(journal_t *journal)
-{
-	return (journal->j_total_len - journal->j_fc_wbufsize) / 4;
-}
+void jbd3_fc_release_bufs(journal_t *journal);
 
 /*
  * is_journal_abort
@@ -1695,6 +1714,25 @@ static inline void jbd3_journal_abort_handle(handle_t *handle)
 	handle->h_aborted = 1;
 }
 
+static inline void jbd3_init_fs_dev_write_error(journal_t *journal)
+{
+	struct address_space *mapping = journal->j_fs_dev->bd_mapping;
+
+	/*
+	 * Save the original wb_err value of client fs's bdev mapping which
+	 * could be used to detect the client fs's metadata async write error.
+	 */
+	errseq_check_and_advance(&mapping->wb_err, &journal->j_fs_dev_wb_err);
+}
+
+static inline int jbd3_check_fs_dev_write_error(journal_t *journal)
+{
+	struct address_space *mapping = journal->j_fs_dev->bd_mapping;
+
+	return errseq_check(&mapping->wb_err,
+			    READ_ONCE(journal->j_fs_dev_wb_err));
+}
+
 #endif /* __KERNEL__   */
 
 /* Comparison functions for transaction IDs: perform comparisons using
@@ -1712,20 +1750,13 @@ static inline int tid_geq(tid_t x, tid_t y)
 	return (difference >= 0);
 }
 
-extern int jbd3_journal_blocks_per_page(struct inode *inode);
+extern int jbd3_journal_blocks_per_folio(struct inode *inode);
 extern size_t journal_tag_bytes(journal_t *journal);
-
-static inline bool jbd3_journal_has_csum_v2or3_feature(journal_t *j)
-{
-	return jbd3_has_feature_csum2(j) || jbd3_has_feature_csum3(j);
-}
 
 static inline int jbd3_journal_has_csum_v2or3(journal_t *journal)
 {
-	WARN_ON_ONCE(jbd3_journal_has_csum_v2or3_feature(journal) &&
-		     journal->j_chksum_driver == NULL);
-
-	return journal->j_chksum_driver != NULL;
+	return jbd3_has_feature_csum2(journal) ||
+	       jbd3_has_feature_csum3(journal);
 }
 
 static inline int jbd3_journal_get_num_fc_blks(journal_superblock_t *jsb)
@@ -1762,28 +1793,9 @@ static inline unsigned long jbd3_log_space_left(journal_t *journal)
 #define BJ_Reserved	4	/* Buffer is reserved for access by journal */
 #define BJ_Types	5
 
-/* JBD uses a CRC32 checksum */
-#define JBD_MAX_CHECKSUM_SIZE 4
-
-static inline u32 jbd3_chksum(journal_t *journal, u32 crc,
-			      const void *address, unsigned int length)
+static inline u32 jbd3_chksum(u32 crc, const void *address, unsigned int length)
 {
-	struct {
-		struct shash_desc shash;
-		char ctx[JBD_MAX_CHECKSUM_SIZE];
-	} desc;
-	int err;
-
-	BUG_ON(crypto_shash_descsize(journal->j_chksum_driver) >
-		JBD_MAX_CHECKSUM_SIZE);
-
-	desc.shash.tfm = journal->j_chksum_driver;
-	*(u32 *)desc.ctx = crc;
-
-	err = crypto_shash_update(&desc.shash, address, length);
-	BUG_ON(err);
-
-	return *(u32 *)desc.ctx;
+	return crc32c(crc, address, length);
 }
 
 /* Return most recent uncommitted transaction */
@@ -1823,8 +1835,5 @@ static inline int jbd3_handle_buffer_credits(handle_t *handle)
 #define JBUFFER_TRACE(jh, info)	do {} while (0)
 
 #endif	/* __KERNEL__ */
-
-#define EFSBADCRC	EBADMSG		/* Bad CRC detected */
-#define EFSCORRUPTED	EUCLEAN		/* Filesystem is corrupted */
 
 #endif	/* _LINUX_JBD3_H */
