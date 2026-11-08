@@ -574,7 +574,7 @@ void inode_lru_list_add(struct inode *inode)
 {
 	__inode_lru_list_add(inode, false);
 }
-//EXPORT_SYMBOL(inode_add_lru);
+EXPORT_SYMBOL(inode_lru_list_add);
 
 static void inode_lru_list_del(struct inode *inode)
 {

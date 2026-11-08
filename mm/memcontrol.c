@@ -3577,12 +3577,6 @@ bool __memcg_slab_post_alloc_hook(struct kmem_cache *s, struct list_lru *lru,
 		return true;
 
 	flags &= gfp_allowed_mask;
-	if (folio_memcg_kmem(folio))
-		obj_cgroup_get_many(__folio_objcg(folio), nr - 1);
-	else
-		css_get_many(&memcg->css, nr - 1);
-}
-EXPORT_SYMBOL_GPL(split_page_memcg);
 
 	if (lru) {
 		int ret;
@@ -3692,6 +3686,7 @@ void split_page_memcg(struct page *page, unsigned order)
 
 	obj_cgroup_get_many(objcg, nr - 1);
 }
+EXPORT_SYMBOL_GPL(split_page_memcg);
 
 void folio_split_memcg_refs(struct folio *folio, unsigned old_order,
 		unsigned new_order)

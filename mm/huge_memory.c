@@ -4260,7 +4260,6 @@ out_no_memcg:
 	count_mthp_stat(old_order, !ret ? MTHP_STAT_SPLIT : MTHP_STAT_SPLIT_FAILED);
 	return ret;
 }
-EXPORT_SYMBOL(split_huge_page_to_list);
 
 /**
  * folio_split_unmapped() - split a large anon folio that is already unmapped
@@ -4359,6 +4358,7 @@ int __split_huge_page_to_list_to_order(struct page *page, struct list_head *list
 	return __folio_split(folio, new_order, &folio->page, page, list,
 			     SPLIT_TYPE_UNIFORM);
 }
+EXPORT_SYMBOL_GPL(__split_huge_page_to_list_to_order);
 
 /**
  * folio_split() - split a folio at @split_at to a @new_order folio
