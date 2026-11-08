@@ -388,6 +388,9 @@ long wb_check_old_data_flush(struct bdi_writeback *wb);
 long wb_check_start_all(struct bdi_writeback *wb);
 long wb_do_writeback_modified(struct bdi_writeback *wb);
 void wb_wakeup_delayed(struct bdi_writeback *wb);
+#ifdef CONFIG_CGROUP_WRITEBACK
+long wb_split_bdi_pages(struct bdi_writeback *wb, long nr_pages);
+#endif
 
 unsigned long global_dirtyable_memory(void);
 void domain_dirty_limits(struct dirty_throttle_control *dtc);

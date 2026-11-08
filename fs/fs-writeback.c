@@ -154,7 +154,18 @@ EXPORT_SYMBOL(wb_wakeup);
  * We have to be careful not to postpone flush work if it is scheduled for
  * earlier. Thus we use queue_delayed_work().
  */
+// static void wb_wakeup_delayed(struct bdi_writeback *wb)
+void wb_wakeup_delayed(struct bdi_writeback *wb)
+{
+	unsigned long timeout;
 
+	timeout = msecs_to_jiffies(dirty_writeback_interval * 10);
+	spin_lock_irq(&wb->work_lock);
+	if (test_bit(WB_registered, &wb->state))
+		queue_delayed_work(bdi_wq, &wb->dwork, timeout);
+	spin_unlock_irq(&wb->work_lock);
+}
+EXPORT_SYMBOL(wb_wakeup_delayed);
 
 void finish_writeback_work(struct wb_writeback_work *work)
 {
@@ -2402,6 +2413,7 @@ long wb_check_start_all(struct bdi_writeback *wb)
 	clear_bit(WB_start_all, &wb->state);
 	return nr_pages;
 }
+EXPORT_SYMBOL(wb_check_start_all);
 
 static long wb_check_start_dontcache(struct bdi_writeback *wb)
 {
@@ -2424,7 +2436,6 @@ static long wb_check_start_dontcache(struct bdi_writeback *wb)
 
 	return nr_pages;
 }
-EXPORT_SYMBOL(wb_check_start_all);
 
 /*
  * Retrieve work items and do the writeback they describe
