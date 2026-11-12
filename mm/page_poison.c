@@ -37,6 +37,7 @@ void __kernel_poison_pages(struct page *page, int n)
 	for (i = 0; i < n; i++)
 		poison_page(page + i);
 }
+EXPORT_SYMBOL_GPL(__kernel_poison_pages);
 
 static bool single_bit_flip(unsigned char a, unsigned char b)
 {
@@ -96,6 +97,7 @@ void __kernel_unpoison_pages(struct page *page, int n)
 	for (i = 0; i < n; i++)
 		unpoison_page(page + i);
 }
+EXPORT_SYMBOL_GPL(__kernel_unpoison_pages);
 
 #ifndef CONFIG_ARCH_SUPPORTS_DEBUG_PAGEALLOC
 void __kernel_map_pages(struct page *page, int numpages, int enable)

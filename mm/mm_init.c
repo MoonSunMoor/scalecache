@@ -2530,6 +2530,7 @@ static int __init early_init_on_free(char *buf)
 early_param("init_on_free", early_init_on_free);
 
 DEFINE_STATIC_KEY_MAYBE(CONFIG_DEBUG_VM, check_pages_enabled);
+EXPORT_SYMBOL_GPL(check_pages_enabled);
 
 static bool check_pages_enabled_early __initdata;
 

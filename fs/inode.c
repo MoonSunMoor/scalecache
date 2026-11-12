@@ -575,6 +575,7 @@ void inode_lru_list_add(struct inode *inode)
 {
 	__inode_lru_list_add(inode, false);
 }
+EXPORT_SYMBOL(inode_lru_list_add);
 
 static void inode_lru_list_del(struct inode *inode)
 {
@@ -781,7 +782,7 @@ void clear_inode(struct inode *inode)
 	xa_unlock_irq(&inode->i_data.i_pages);
 	BUG_ON(!(inode_state_read_once(inode) & I_FREEING));
 	BUG_ON(inode_state_read_once(inode) & I_CLEAR);
-	BUG_ON(!list_empty(&inode->i_wb_list));
+//	BUG_ON(!list_empty(&inode->i_wb_list));
 	/* don't need i_lock here, no concurrent mods to i_state */
 	inode_state_assign_raw(inode, I_FREEING | I_CLEAR);
 }

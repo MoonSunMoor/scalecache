@@ -41,6 +41,9 @@
 DEFINE_STATIC_KEY_FALSE(cpusets_pre_enable_key);
 DEFINE_STATIC_KEY_FALSE(cpusets_enabled_key);
 
+EXPORT_SYMBOL(cpusets_pre_enable_key);
+EXPORT_SYMBOL(cpusets_enabled_key);
+
 /*
  * There could be abnormal cpuset configurations for cpu or memory
  * node binding, add this key to provide a quick low-cost judgment
@@ -4194,6 +4197,7 @@ int cpuset_nodemask_valid_mems_allowed(nodemask_t *nodemask)
 {
 	return nodes_intersects(*nodemask, current->mems_allowed);
 }
+EXPORT_SYMBOL(cpuset_nodemask_valid_mems_allowed);
 
 /*
  * nearest_hardwall_ancestor() - Returns the nearest mem_exclusive or

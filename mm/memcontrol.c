@@ -3178,6 +3178,7 @@ void __memcg_kmem_uncharge_page(struct page *page, int order)
 	page->memcg_data = 0;
 	obj_cgroup_put(objcg);
 }
+EXPORT_SYMBOL_GPL(__memcg_kmem_uncharge_page);
 
 static struct obj_stock_pcp *trylock_stock(void)
 {
@@ -3685,6 +3686,7 @@ void split_page_memcg(struct page *page, unsigned order)
 
 	obj_cgroup_get_many(objcg, nr - 1);
 }
+EXPORT_SYMBOL_GPL(split_page_memcg);
 
 void folio_split_memcg_refs(struct folio *folio, unsigned old_order,
 		unsigned new_order)

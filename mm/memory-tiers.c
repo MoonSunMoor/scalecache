@@ -372,6 +372,7 @@ int next_demotion_node(int node, const nodemask_t *allowed_mask)
 	nodes_complement(mask, *allowed_mask);
 	return find_next_best_node(node, &mask);
 }
+EXPORT_SYMBOL_GPL(next_demotion_node);
 
 static void disable_all_demotion_targets(void)
 {
@@ -937,6 +938,7 @@ static int __init memory_tier_init(void)
 subsys_initcall(memory_tier_init);
 
 bool numa_demotion_enabled = false;
+EXPORT_SYMBOL_GPL(numa_demotion_enabled);
 
 #ifdef CONFIG_NUMA_MIGRATION
 #ifdef CONFIG_SYSFS
