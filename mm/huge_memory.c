@@ -4358,7 +4358,7 @@ int __split_huge_page_to_list_to_order(struct page *page, struct list_head *list
 	return __folio_split(folio, new_order, &folio->page, page, list,
 			     SPLIT_TYPE_UNIFORM);
 }
-EXPORT_SYMBOL_GPL(__split_huge_page_to_list_to_order);
+EXPORT_SYMBOL(__split_huge_page_to_list_to_order);
 
 /**
  * folio_split() - split a folio at @split_at to a @new_order folio

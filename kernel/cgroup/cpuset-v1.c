@@ -119,7 +119,7 @@ static int fmeter_getrate(struct fmeter *fmp)
  */
 
 int cpuset_memory_pressure_enabled __read_mostly;
-EXPORT_SYMBOL_GPL(cpuset_memory_pressure_enabled);
+EXPORT_SYMBOL(cpuset_memory_pressure_enabled);
 
 /*
  * __cpuset_memory_pressure_bump - keep stats of per-cpuset reclaims.
@@ -145,7 +145,7 @@ void __cpuset_memory_pressure_bump(void)
 	fmeter_markevent(&task_cs(current)->fmeter);
 	rcu_read_unlock();
 }
-EXPORT_SYMBOL_GPL(__cpuset_memory_pressure_bump);
+EXPORT_SYMBOL(__cpuset_memory_pressure_bump);
 
 static int update_relax_domain_level(struct cpuset *cs, s64 val)
 {
