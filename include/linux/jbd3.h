@@ -21,7 +21,7 @@
 
 #include <linux/types.h>
 #include <linux/buffer_head.h>
-#include <linux/journal-head.h>
+#include <linux/journal-head3.h>
 #include <linux/stddef.h>
 #include <linux/mutex.h>
 #include <linux/timer.h>
@@ -34,9 +34,9 @@
 #define journal_oom_retry 1
 
 /*
- * Define JBD3_PARANIOD_IOFAIL to cause a kernel BUG() if ext4 finds
+ * Define JBD3_PARANIOD_IOFAIL to cause a kernel BUG() if pxt4 finds
  * certain classes of error which can occur due to failed IOs.  Under
- * normal use we want ext4 to continue after such errors, because
+ * normal use we want pxt4 to continue after such errors, because
  * hardware _can_ fail, but for debugging purposes when running tests on
  * known-good hardware we may want to trap these errors.
  */
@@ -642,7 +642,7 @@ struct transaction_s
 	struct journal_head	*t_shadow_list;
 
 	/*
-	 * List of inodes associated with the transaction; e.g., ext4 uses
+	 * List of inodes associated with the transaction; e.g., pxt4 uses
 	 * this to track inodes in data=ordered and data=journal mode that
 	 * need special handling on transaction commit; also used by ocfs2.
 	 * [j_list_lock]
