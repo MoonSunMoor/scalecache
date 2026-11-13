@@ -827,7 +827,6 @@ descend:
 		parent = node;
 	}
 
-	CC_XA_NODE_BUG_ON(node, shift);
 	return entry;
 }
 
