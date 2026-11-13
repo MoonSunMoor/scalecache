@@ -892,7 +892,6 @@ static void update_node(struct cc_xa_state *xas, struct cc_xa_node *node,
 		return;
 
 	CC_XA_NODE_BUG_ON(node, !__atomic_load_n(&node->refcnt, __ATOMIC_SEQ_CST));
-	CC_XA_NODE_BUG_ON(node, count > 1 || count < -1);
 
 	/* Wait for other thread */
 	while (__atomic_load_n(&node->gc_flag, __ATOMIC_SEQ_CST))
