@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0+
-/* Actual CC/ordinary XArray, workingset and list-LRU algorithms.
+/* Actual CC/ordinary XArray, workingset, truncate and list-LRU algorithms.
  * Native pthread locks, one NUMA node, no memcg or kernel IRQ context.
  */
 #include "xarray-shared.h"
 #include "test.h"
 #include <linux/cc_xarray.h>
+#include "../../../include/linux/folio_batch.h"
 #include <string.h>
 #include <errno.h>
 
 #define spin_trylock(lock) (!pthread_mutex_trylock(lock))
 static void replace_shadow(void);
+static void replace_observed_shadow(void);
 static void **watched_slot;
-static bool at_cas, at_unlock, scanning;
+static bool at_cas, at_unlock, scanning, before_clear;
 static unsigned int checks;
 static int live_entry;
 
@@ -136,6 +138,43 @@ static unsigned int observed_clear(struct cc_xa_state *xas)
 #undef spin_unlock
 #define spin_unlock(lock) pthread_mutex_unlock(lock)
 
+typedef unsigned long pgoff_t;
+
+static bool shmem_mapping(const struct address_space *map)
+{
+	CHECK(map == &mapping);
+	return false;
+}
+
+static bool dax_mapping(const struct address_space *map)
+{
+	CHECK(map == &mapping);
+	return false;
+}
+
+static void dax_delete_mapping_entry(struct address_space *map, pgoff_t index)
+{
+	CHECK(!"DAX is outside this regular-file fixture");
+}
+
+static unsigned int observed_clear_entry(struct cc_xa_state *xas, void *entry)
+{
+	unsigned int removed;
+
+	if (before_clear && xas->xa_index == selected_index) {
+		before_clear = false;
+		replace_observed_shadow();
+	}
+	removed = cc_xas_clear_shadow_entry(xas, entry);
+	cleared_slots += removed;
+	return removed;
+}
+
+#include "generated/cc-shadow-swap.h"
+#define cc_xas_clear_shadow_entry(xas, entry) observed_clear_entry(xas, entry)
+#include "generated/cc-shadow-truncate.h"
+#undef cc_xas_clear_shadow_entry
+
 static void put(unsigned long index, void *entry)
 {
 	CC_XA_STATE(xas, CC_XARRAY(&mapping.i_pages), index);
@@ -163,7 +202,10 @@ static void replace_shadow(void)
 	put(selected_index, &live_entry);
 }
 
-
+static void replace_observed_shadow(void)
+{
+	put(selected_index, cc_xa_mk_value(9));
+}
 
 static struct cc_xa_node *node_at(unsigned long index)
 {
@@ -350,13 +392,185 @@ static void ordinary_case(void)
 	finish(true);
 }
 
+static void truncate_case(bool batch, const char *name)
+{
+	CC_XA_STATE(reader, CC_XARRAY(&mapping.i_pages), 0);
+	struct cc_xarray *xa = CC_XARRAY(&mapping.i_pages);
+	struct cc_xa_node *node = NULL;
+	struct inode inode;
+	struct folio_batch fbatch;
+	pgoff_t indices[4];
+	void *shadow = cc_xa_mk_value(7);
+	static int leading_live;
+	bool ordinary = !strcmp(name, "ordinary");
+	bool held = !strcmp(name, "reader") || !strcmp(name, "reader-nonroot");
+	bool head = !strncmp(name, "head", 4);
+	bool writer = strstr(name, "writer");
+	bool marked = strstr(name, "marked");
+	bool changed = strstr(name, "changed-shadow");
+	bool bounds = !strcmp(name, "bounds");
+	bool siblings = !strcmp(name, "siblings");
+	bool higher = !strcmp(name, "higher-order");
+	bool preserved = marked || siblings || higher;
+	unsigned long index = CC_XA_CHUNK_SIZE + 1, last;
+	unsigned long group_last = higher ? 2 * CC_XA_CHUNK_SIZE - 1 : 3;
+	unsigned int i;
+	int allocated;
 
+	if (head)
+		index = 0;
+	else if (!strcmp(name, "reader") || marked || siblings || ordinary)
+		index = 1;
+	else if (higher)
+		index = CC_XA_CHUNK_SIZE;
+	else if (!strcmp(name, "high-index"))
+		index = (1UL << 36) + 1;
+	else if (!strcmp(name, "last-index"))
+		index = ULONG_MAX;
+	last = index + (bounds ? 2 : siblings ? 1 : 0);
+	init_mapping(ordinary);
+	spin_lock_init(&inode.i_lock);
+	mapping.host = &inode;
+	inode_lru_updates = 0;
+	if (ordinary) {
+		XA_STATE(xas, &mapping.i_pages, index);
+
+		xas_set_update(&xas, workingset_update_node);
+		do {
+			xas_lock(&xas);
+			xas_store(&xas, shadow);
+			xas_unlock(&xas);
+		} while (xas_nomem(&xas, GFP_KERNEL));
+		CHECK(!xas_error(&xas));
+	} else if (siblings || higher) {
+		CHECK(!cc_xa_is_err(cc_xa_store_range(xa, 0, group_last,
+						   shadow, GFP_KERNEL)));
+	} else {
+		put(index, shadow);
+		if (bounds) {
+			put(index - 2, &leading_live);
+			put(index - 1, shadow);
+			put(index + 1, &live_entry);
+			put(last, shadow);
+			put(last + 1, shadow);
+		}
+	}
+	if (!head && !ordinary)
+		node = node_at(index);
+	if (siblings || higher) {
+		cc_xa_lock(xa);
+		cc_workingset_update_node(node);
+		cc_xa_unlock(xa);
+	}
+	if (marked)
+		cc_xa_set_mark(xa, index, CC_XA_MARK_0);
+	if (held) {
+		cc_xas_set(&reader, index);
+		CHECK(cc_xas_load(&reader, false) == shadow);
+		CHECK(node->refcnt == 2);
+	}
+	before_clear = changed;
+	if (writer || changed)
+		selected_index = index;
+	if (writer) {
+		watched_slot = head ? (void **)&xa->xa_head :
+			(void **)&node->slots[index & CC_XA_CHUNK_MASK];
+		at_cas = true;
+	}
+	allocated = nr_allocated;
+	cleared_slots = 0;
+	scanning = true;
+	if (batch) {
+		folio_batch_init(&fbatch);
+		if (bounds) {
+			indices[0] = index - 2;
+			indices[1] = index;
+			indices[2] = index + 1;
+			indices[3] = last;
+			folio_batch_add(&fbatch, (struct folio *)&leading_live);
+			folio_batch_add(&fbatch, (struct folio *)shadow);
+			folio_batch_add(&fbatch, (struct folio *)&live_entry);
+			folio_batch_add(&fbatch, (struct folio *)shadow);
+		} else {
+			indices[0] = index;
+			folio_batch_add(&fbatch, (struct folio *)shadow);
+		}
+		truncate_folio_batch_exceptionals(&mapping, &fbatch, indices);
+		CHECK(folio_batch_count(&fbatch) == (bounds ? 2 : 0));
+		if (bounds) {
+			CHECK(fbatch.folios[0] == (struct folio *)&leading_live);
+			CHECK(fbatch.folios[1] == (struct folio *)&live_entry);
+		}
+	} else {
+		clear_shadow_entries(&mapping, index, last);
+	}
+	scanning = false;
+	rcu_barrier();
+	CHECK(!at_cas && !before_clear);
+	CHECK(!pthread_mutex_trylock(&mapping.i_pages.xa_lock));
+	pthread_mutex_unlock(&mapping.i_pages.xa_lock);
+	CHECK(!pthread_mutex_trylock(&inode.i_lock));
+	pthread_mutex_unlock(&inode.i_lock);
+	CHECK(lru_node.nr_items == stats[WORKINGSET_NODES]);
+	CHECK(lru_node.nr_items == lru_node.lru.nr_items);
+	if (ordinary) {
+		CHECK(!xa_load(&mapping.i_pages, index));
+		CHECK(!nr_allocated);
+	} else {
+		CHECK(nr_allocated == allocated);
+		CHECK(cc_xa_is_ccxarray(xa));
+		CHECK(cc_xa_load(xa, index) == (writer ? &live_entry :
+			changed ? cc_xa_mk_value(9) : preserved ? shadow : NULL));
+		CHECK(cleared_slots ==
+			(writer || changed || preserved ? 0 : bounds ? 2 : 1));
+		if (bounds) {
+			CHECK(cc_xa_load(xa, index - 2) == &leading_live);
+			CHECK(cc_xa_load(xa, index - 1) == shadow);
+			CHECK(cc_xa_load(xa, index + 1) == &live_entry);
+			CHECK(!cc_xa_load(xa, last));
+			CHECK(cc_xa_load(xa, last + 1) == shadow);
+		}
+		if (writer)
+			for (i = 0; i < CC_XA_MAX_MARKS; i++)
+				CHECK(cc_xa_get_mark(xa, index, (__force cc_xa_mark_t)i));
+		if (marked)
+			CHECK(cc_xa_get_mark(xa, index, CC_XA_MARK_0));
+		if (siblings || higher) {
+			CHECK(cc_xa_load(xa, 0) == shadow);
+			CHECK(cc_xa_load(xa, group_last) == shadow);
+		}
+		if (node) {
+			unsigned int values = higher ? 2 : siblings ? 4 :
+				bounds ? 2 : marked || changed ? 1 : 0;
+
+			if (changed)
+				CHECK(stats[WORKINGSET_NODES] == 1);
+			CHECK(node->nr_values == values);
+			CHECK(node->count == values + (writer || bounds));
+		}
+		if (held) {
+			CHECK(node->refcnt == 2 && !node->del);
+			cc_xas_rewind_refcnt(&reader);
+			cc_xas_clear_xa_node(&reader);
+		}
+		if (cc_xa_is_node(xa->xa_head))
+			check_refs(cc_xa_to_node(xa->xa_head));
+	}
+	if (ordinary || (head && !writer))
+		CHECK(inode_lru_updates == 1);
+	finish(ordinary);
+	pthread_mutex_destroy(&inode.i_lock);
+}
 
 int main(int argc, char **argv)
 {
 	const char *cases[] = { "reader", "writer", "mixed", "root", "high-index",
 		"batch", "siblings", "marked", "ordinary" };
-	unsigned int i;
+	const char *truncate_cases[] = { "reader", "reader-nonroot", "head",
+		"head-writer", "head-marked", "changed-shadow", "head-changed-shadow",
+		"writer", "bounds", "marked", "siblings", "higher-order",
+		"high-index", "last-index", "ordinary" };
+	unsigned int i, batch;
 
 	rcu_register_thread();
 	radix_tree_init();
@@ -370,6 +584,19 @@ int main(int argc, char **argv)
 		else
 			cc_case(cases[i]);
 		printf("PASS %s\n", cases[i]);
+	}
+	for (i = 0; i < sizeof(truncate_cases) / sizeof(truncate_cases[0]); i++) {
+		for (batch = 0; batch < 2; batch++) {
+			char name[64];
+
+			snprintf(name, sizeof(name), "truncate-%s-%s",
+				 batch ? "batch" : "range", truncate_cases[i]);
+			if (argc > 1 && strcmp(argv[1], name) &&
+			    strcmp(argv[1], "truncate"))
+				continue;
+			truncate_case(batch, truncate_cases[i]);
+			printf("PASS %s\n", name);
+		}
 	}
 	radix_tree_cpu_dead(1);
 	rcu_barrier();

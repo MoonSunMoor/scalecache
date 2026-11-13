@@ -1614,6 +1614,7 @@ static inline bool cc_xas_retry(struct cc_xa_state *xas, const void *entry)
 
 void *cc_xas_load(struct cc_xa_state *, bool rewind);
 void *cc_xas_store(struct cc_xa_state *, void *entry);
+unsigned int cc_xas_clear_shadow_entry(struct cc_xa_state *, void *entry);
 unsigned int cc_xas_clear_shadow_node(struct cc_xa_state *);
 void *cc_xas_find(struct cc_xa_state *, unsigned long max);
 void *cc_xas_find_conflict(struct cc_xa_state *);

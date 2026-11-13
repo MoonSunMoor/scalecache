@@ -24,15 +24,24 @@ cc-shadow-reclaim: cc-shadow-reclaim.o $(SHARED_OFILES)
 cc-shadow-reclaim.o: $(SHARED_DEPS) ../../../lib/cc_xarray.c \
 	../../../include/linux/cc_xarray.h ../shared/linux/cc_xarray.h \
 	../shared/linux/irqflags.h generated/cc-shadow-list-lru.h \
-	generated/cc-shadow-workingset.h generated/cc-shadow-mapping.h
+	generated/cc-shadow-workingset.h generated/cc-shadow-truncate.h \
+	generated/cc-shadow-swap.h generated/cc-shadow-mapping.h \
+	../../../include/linux/folio_batch.h
 
 WORKINGSET_SOURCE ?= ../../../mm/workingset.c
+TRUNCATE_SOURCE ?= ../../../mm/truncate.c
 generated/cc-shadow-list-lru.h: cc-shadow-sources.py ../../../mm/list_lru.c
 	@mkdir -p generated
 	python3 $< lru ../../../mm/list_lru.c > $@
 generated/cc-shadow-workingset.h: cc-shadow-sources.py $(WORKINGSET_SOURCE)
 	@mkdir -p generated
 	python3 $< workingset $(WORKINGSET_SOURCE) > $@
+generated/cc-shadow-truncate.h: cc-shadow-sources.py $(TRUNCATE_SOURCE)
+	@mkdir -p generated
+	python3 $< truncate $(TRUNCATE_SOURCE) > $@
+generated/cc-shadow-swap.h: cc-shadow-sources.py ../../../mm/swap.c
+	@mkdir -p generated
+	python3 $< swap ../../../mm/swap.c > $@
 generated/cc-shadow-mapping.h: cc-shadow-sources.py ../../../include/linux/pagemap.h
 	@mkdir -p generated
 	python3 $< mapping ../../../include/linux/pagemap.h > $@

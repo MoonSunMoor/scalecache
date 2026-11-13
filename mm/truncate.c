@@ -23,6 +23,24 @@
 #include <linux/rmap.h>
 #include "internal.h"
 
+static void cc_clear_shadow_entries(struct address_space *mapping,
+				    unsigned long index, unsigned long max)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+	void *entry;
+
+	cc_xas_set_update(&xas, cc_workingset_update_node);
+	for (entry = cc_xa_find(xas.xa, &index, max, CC_XA_PRESENT); entry;
+	     entry = cc_xa_find_after(xas.xa, &index, max, CC_XA_PRESENT)) {
+		if (!cc_xa_is_value(entry))
+			continue;
+		cc_xas_set(&xas, index);
+		entry = cc_xas_load(&xas, false);
+		cc_xas_clear_shadow_entry(&xas, entry);
+		cc_xas_clear_xa_node(&xas);
+	}
+}
+
 static void clear_shadow_entries(struct address_space *mapping,
 				 unsigned long start, unsigned long max)
 {
@@ -39,9 +57,13 @@ static void clear_shadow_entries(struct address_space *mapping,
 	xas_lock_irq(&xas);
 
 	/* Clear all shadow entries from start to max */
-	xas_for_each(&xas, folio, max) {
-		if (xa_is_value(folio))
-			xas_store(&xas, NULL);
+	if (cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages))) {
+		cc_clear_shadow_entries(mapping, start, max);
+	} else {
+		xas_for_each(&xas, folio, max) {
+			if (xa_is_value(folio))
+				xas_store(&xas, NULL);
+		}
 	}
 
 	xas_unlock_irq(&xas);
@@ -104,9 +126,13 @@ static void truncate_folio_batch_exceptionals(struct address_space *mapping,
 	spin_lock(&mapping->host->i_lock);
 	xas_lock_irq(&xas);
 
-	xas_for_each(&xas, folio, indices[nr-1]) {
-		if (xa_is_value(folio))
-			xas_store(&xas, NULL);
+	if (cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages))) {
+		cc_clear_shadow_entries(mapping, indices[j], indices[nr-1]);
+	} else {
+		xas_for_each(&xas, folio, indices[nr-1]) {
+			if (xa_is_value(folio))
+				xas_store(&xas, NULL);
+		}
 	}
 
 	xas_unlock_irq(&xas);

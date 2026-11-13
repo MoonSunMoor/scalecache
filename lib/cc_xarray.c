@@ -1050,6 +1050,35 @@ static bool cc_xas_clear_shadow_slot(struct cc_xa_state *xas,
 }
 
 /**
+ * cc_xas_clear_shadow_entry() - Conditionally clear one order-0 shadow.
+ * @xas: State loaded from the root with retained traversal references.
+ * @entry: Shadow observed by cc_xas_load() before this call.
+ *
+ * Removes the slot only if it still contains @entry.  Marked and multi-index
+ * entries are left intact.  Shadow marks are not modified.  Releases traversal
+ * references on every return; the caller must release the cursor separately.
+ *
+ * Return: Number of shadow slots removed (zero or one).
+ */
+unsigned int cc_xas_clear_shadow_entry(struct cc_xa_state *xas, void *entry)
+{
+	struct cc_xa_node *node;
+	unsigned int removed = 0;
+
+	if (cc_xas_invalid(xas))
+		goto out;
+	node = xas->xa_node;
+	if (node && node->shift)
+		goto out;
+	removed = cc_xas_clear_shadow_slot(xas, xas->xa_offset, entry);
+	if (removed)
+		update_node(xas, node, -1, -1);
+out:
+	cc_xas_rewind_refcnt(xas);
+	return removed;
+}
+
+/**
  * cc_xas_clear_shadow_node() - Conditionally clear unmarked single-slot shadows.
  * @xas: State retaining the selected node and its traversal references.
  *
