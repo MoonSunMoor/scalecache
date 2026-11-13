@@ -2268,6 +2268,7 @@ void *cc_xa_store_range(struct cc_xarray *xa, unsigned long first,
 				order = __ffs(last + 1);
 			cc_xas_set_order(&xas, last, order);
 			cc_xas_create(&xas, true);
+			cc_xas_rewind_refcnt(&xas);
 			if (cc_xas_error(&xas))
 				goto unlock;
 		}
