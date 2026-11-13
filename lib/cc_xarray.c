@@ -782,7 +782,7 @@ static void *cc_xas_create(struct cc_xa_state *xas, bool allow_root)
 			parent = xas->xa_node;
 			node = cc_xas_alloc(xas, shift);
 			if (!node)
-				break;
+				return NULL;
 			node = cc_xa_get_node(xas, node);
 			if (cc_xa_track_free(xa))
 				node_mark_all(node, CC_XA_FREE_MARK);
@@ -931,6 +931,9 @@ static void update_node(struct cc_xa_state *xas, struct cc_xa_node *node,
  * covered by the range).  This is not a problem for any current users,
  * and can be changed if needed.
  *
+ * Releases retained traversal references on every return.  The cursor and
+ * error state are preserved; callers must release the cursor separately.
+ *
  * Return: The old entry at this index.
  */
 void *cc_xas_store(struct cc_xa_state *xas, void *entry)
@@ -952,12 +955,12 @@ void *cc_xas_store(struct cc_xa_state *xas, void *entry)
 	}
 
 	if (cc_xas_invalid(xas))
-		return first;
+		goto out;
 	node = xas->xa_node;
 	if (node && (xas->xa_shift < node->shift))
 		xas->xa_sibs = 0;
 	if ((first == entry) && !xas->xa_sibs)	// No need to update slot! It's already same!
-		return first;
+		goto out;
 
 	next = first;
 	offset = xas->xa_offset;		// update offset, the slot mask
@@ -983,7 +986,8 @@ void *cc_xas_store(struct cc_xa_state *xas, void *entry)
 		/* Perform CAS */
 		if ((curr = __sync_val_compare_and_swap(slot, next, entry)) != next) {
 			cc_xas_set_err(xas, -EEXIST);
-			return curr;
+			first = curr;
+			goto out;
 		}
 		if (cc_xa_is_node(next) && (!node || node->shift))	// coming from scan_shadow_nodes()
 			cc_xas_free_nodes(xas, cc_xa_to_node(next));
@@ -1010,6 +1014,7 @@ void *cc_xas_store(struct cc_xa_state *xas, void *entry)
 	}
 
 	update_node(xas, node, count, values);
+out:
 	cc_xas_rewind_refcnt(xas);
 	return first;
 }
