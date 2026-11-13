@@ -627,44 +627,63 @@ static void cc_xas_free_nodes(struct cc_xa_state *xas, struct cc_xa_node *top)
 }
 
 /*
- * cc_xas_expand adds nodes to the head of the tree until it has reached
- * sufficient height to be able to contain @xas->xa_index
+ * Add parents until the selected head can contain cc_xas_max(xas).  Return
+ * that raw head snapshot and its height together; an empty head returns the
+ * planned allocation height.  Only the cursor reference follows expansion,
+ * never the downward traversal trace.
+ *
+ * Parent election makes a candidate shared before head publication.  Helpers
+ * may publish it, but its election winner owns the update callback.  Shared
+ * nodes retain the existing quiescent physical-reclamation requirement.
  */
-static int cc_xas_expand(struct cc_xa_state *xas, void *head)
+static int cc_xas_expand(struct cc_xa_state *xas, void **head)
 {
 	struct cc_xarray *xa = xas->xa;
-	struct cc_xa_node *node = NULL, *oldroot = NULL;
-	unsigned int shift = 0;
 	unsigned long max = cc_xas_max(xas);
 
-	if (!head) {	// cc_xarray is empty!
-		if (max == 0)
-			return 0;
-		while ((max >> shift) >= CC_XA_CHUNK_SIZE)
-			shift += CC_XA_CHUNK_SHIFT;
-		return shift + CC_XA_CHUNK_SHIFT;
-	} else if (cc_xa_is_node(head)) {
-		node = cc_xa_to_node(head);
-		shift = node->shift + CC_XA_CHUNK_SHIFT;
-	}	// else: cc_xarray head is pointing entry!
-	//xas->xa_node = NULL;
-	cc_xas_set_xa_node(xas, NULL);
-
-	while (max > max_index(head)) {
-		void *old_head, *cur_head;
+	for (;;) {
+		void *old_head = cc_xa_head_locked(xa), *entry = old_head;
+		struct cc_xa_node *node, *oldroot = NULL;
+		unsigned int shift = 0;
 		cc_xa_mark_t mark = 0;
 
-		CC_XA_NODE_BUG_ON(node, shift > BITS_PER_LONG);
-		node = cc_xas_alloc(xas, shift);	// alloc new node
+		if (cc_xa_is_node(old_head)) {
+			oldroot = cc_xa_to_node(old_head);
+			cc_xas_set_xa_node(xas, oldroot);
+			shift = oldroot->shift + CC_XA_CHUNK_SHIFT;
+		} else {
+			cc_xas_set_xa_node(xas, NULL);
+			if (!old_head && !cc_xa_zero_busy(xa)) {
+				*head = NULL;
+				if (max == 0)
+					return 0;
+				while ((max >> shift) >= CC_XA_CHUNK_SIZE)
+					shift += CC_XA_CHUNK_SHIFT;
+				return shift + CC_XA_CHUNK_SHIFT;
+			}
+			if (!old_head)
+				entry = CC_XA_ZERO_ENTRY;
+		}
+
+		if (max <= max_index(old_head)) {
+			*head = old_head;
+			return shift;
+		}
+
+		CC_XA_NODE_BUG_ON(oldroot, shift > BITS_PER_LONG);
+		node = cc_xas_alloc(xas, shift);
 		if (!node)
 			return -ENOMEM;
 
+		/* Allocation inherits the cursor parent; this is a new root. */
+		RCU_INIT_POINTER(node->parent, NULL);
+		node->offset = 0;
 		node->count = 1;
-		if (cc_xa_is_value(head))
+		if (cc_xa_is_value(entry))
 			node->nr_values = 1;
-		RCU_INIT_POINTER(node->slots[0], head);
+		RCU_INIT_POINTER(node->slots[0], entry);
 
-		/* Propagate the aggregated mark info to the new child */
+		/* Propagate the aggregated mark info to the new child. */
 		for (;;) {
 			if (cc_xa_track_free(xa) && mark == CC_XA_FREE_MARK) {
 				node_mark_all(node, CC_XA_FREE_MARK);
@@ -680,47 +699,30 @@ static int cc_xas_expand(struct cc_xa_state *xas, void *head)
 			mark_inc(mark);
 		}
 
-		/*
-		 * Now that the new node is fully initialised, we can add
-		 * it to the tree
-		 */
-		if (cc_xa_is_node(head)) {
+		if (oldroot) {
 			struct cc_xa_node *root_parent;
-			//cc_xa_to_node(head)->offset = 0;
-			oldroot = cc_xa_to_node(head);
+
 			oldroot->offset = 0;
-			//rcu_assign_pointer(cc_xa_to_node(head)->parent, node);
-			/* Perform CAS */
-			if ((root_parent = __sync_val_compare_and_swap(
-					&oldroot->parent, NULL, node)) != NULL) {
+			root_parent = __sync_val_compare_and_swap(
+					&oldroot->parent, NULL, node);
+			if (root_parent) {
+				/* Only our losing, unpublished candidate is private. */
 				cc_xa_node_free(node);
-				head = cc_xa_mk_node(root_parent);
-				node = root_parent; /* Important! */
-				goto ascend;
+				(void)__sync_val_compare_and_swap(&xa->xa_head,
+						old_head, cc_xa_mk_node(root_parent));
+				continue;
 			}
-		}
-		/* TODO: Can anybody come across this line?
-		 * Maybe other threads should fail CAS and goto ascend,
-		 * while only one thread can come below this line!! */
-		/* Perform CAS */
-		old_head = head;
-		head = cc_xa_mk_node(node);
-		//rcu_assign_pointer(xa->xa_head, head);
-		if ((cur_head = __sync_val_compare_and_swap(&xa->xa_head, old_head, head)) != old_head) {
+			/* A linked parent remains shared even if this CAS loses. */
+			(void)__sync_val_compare_and_swap(&xa->xa_head, old_head,
+						cc_xa_mk_node(node));
+		} else if (__sync_val_compare_and_swap(&xa->xa_head, old_head,
+						cc_xa_mk_node(node)) != old_head) {
 			cc_xa_node_free(node);
-			head = cur_head;
-			node = cc_xa_to_node(head);
-			shift = node->shift;
-			goto ascend;
+			continue;
 		}
 		cc_xas_update(xas, node);
-ascend:
-		shift += CC_XA_CHUNK_SHIFT;
+		/* Reobserve the head instead of ascending an unpublished parent. */
 	}
-
-	//xas->xa_node = node;
-	cc_xas_set_xa_node(xas, node);
-	return shift;
 }
 
 /*
@@ -738,6 +740,10 @@ ascend:
  *
  * Notice that the node containing the slot returned from this function 
  * got refcnt increased. User of this function must decrease refcnt of the node.
+ *
+ * Root selection keeps its head snapshot and height paired.  If initial
+ * root publication loses, discard only the private candidate and reselect.
+ *
  */
 static void *cc_xas_create(struct cc_xa_state *xas, bool allow_root)
 {
@@ -750,17 +756,13 @@ static void *cc_xas_create(struct cc_xa_state *xas, bool allow_root)
 	unsigned char parent_cnt;
 
 	if (cc_xas_top(node)) {
-		entry = cc_xa_head_locked(xa);
-		//xas->xa_node = NULL;
-		cc_xas_set_xa_node(xas, NULL);
-		if (!entry && cc_xa_zero_busy(xa))
-			entry = CC_XA_ZERO_ENTRY;
-		shift = cc_xas_expand(xas, entry);
+select_root:
+		shift = cc_xas_expand(xas, &entry);
 		if (shift < 0)
 			return NULL;
 		if (!shift && !allow_root)
 			shift = CC_XA_CHUNK_SHIFT;
-		entry = cc_xa_head_locked(xa);
+		node = xas->xa_node;
 		slot = &xa->xa_head;
 	} else if (cc_xas_error(xas)) {
 		return NULL;
@@ -792,6 +794,8 @@ static void *cc_xas_create(struct cc_xa_state *xas, bool allow_root)
 					slot, NULL, cc_xa_mk_node(node))) != NULL) {
 				cc_xa_put_node(xas, node);
 				cc_xa_node_free(node);
+				if (slot == &xa->xa_head)
+					goto select_root;
 				node = cc_xa_get_node(xas, cc_xa_to_node(curr));
 				goto descend;
 			}
