@@ -1022,6 +1022,63 @@ out:
 }
 EXPORT_SYMBOL_GPL(cc_xas_store);
 
+static bool cc_xas_clear_shadow_slot(struct cc_xa_state *xas,
+				     unsigned int offset, void *entry)
+{
+	struct cc_xa_node *node = xas->xa_node;
+	void __rcu **slot;
+
+	if (!cc_xa_is_value(entry))
+		return false;
+	if (node) {
+		if (node_get_mark(node, offset, CC_XA_MARK_0) ||
+		    node_get_mark(node, offset, CC_XA_MARK_1) ||
+		    node_get_mark(node, offset, CC_XA_MARK_2))
+			return false;
+		if (offset + 1 < CC_XA_CHUNK_SIZE &&
+		    cc_xa_is_sibling(cc_xa_entry(xas->xa, node, offset + 1)))
+			return false;
+		slot = &node->slots[offset];
+	} else {
+		if (cc_xa_marked(xas->xa, CC_XA_MARK_0) ||
+		    cc_xa_marked(xas->xa, CC_XA_MARK_1) ||
+		    cc_xa_marked(xas->xa, CC_XA_MARK_2))
+			return false;
+		slot = &xas->xa->xa_head;
+	}
+	return __sync_val_compare_and_swap(slot, entry, NULL) == entry;
+}
+
+/**
+ * cc_xas_clear_shadow_node() - Conditionally clear unmarked single-slot shadows.
+ * @xas: State retaining the selected node and its traversal references.
+ *
+ * Changed, marked and sibling-backed entries are left intact.  Only successful
+ * removals contribute to the node counters.  Shadow marks are not modified.
+ * Releases traversal references; the caller must release the cursor.
+ *
+ * Return: Number of shadow slots removed, not physically reclaimed nodes.
+ */
+unsigned int cc_xas_clear_shadow_node(struct cc_xa_state *xas)
+{
+	struct cc_xa_node *node = xas->xa_node;
+	unsigned int offset;
+	int removed = 0;
+
+	for (offset = 0; offset < CC_XA_CHUNK_SIZE; offset++) {
+		void *entry = cc_xa_entry(xas->xa, node, offset);
+
+		removed += cc_xas_clear_shadow_slot(xas, offset, entry);
+	}
+
+	if (removed)
+		update_node(xas, node, -removed, -removed);
+	else
+		cc_xas_update(xas, node);
+	cc_xas_rewind_refcnt(xas);
+	return removed;
+}
+
 /**
  * cc_xas_get_mark() - Returns the state of this mark.
  * @xas: XArray operation state.

@@ -747,6 +747,34 @@ static unsigned long count_shadow_nodes(struct shrinker *shrinker,
 	return nodes - max_nodes;
 }
 
+static void cc_workingset_clear_node(struct cc_xa_node *node,
+				    struct list_lru_one *lru)
+{
+	CC_XA_STATE(xas, node->array, 0);
+	CC_XA_STATE(cursor, node->array, 0);
+	struct cc_xa_node *child = node, *parent;
+
+	cc_xas_set_xa_node(&cursor, node);
+	spin_unlock(&lru->lock);
+
+	while ((parent = cc_xa_parent(node->array, child))) {
+		xas.xa_index |= (unsigned long)child->offset << parent->shift;
+		child = parent;
+	}
+
+	cc_xas_set_update(&xas, cc_workingset_update_node);
+	cc_xas_load(&xas, false);
+	if (xas.xa_node == node) {
+		cc_xas_clear_xa_node(&cursor);
+		cc_xas_clear_shadow_node(&xas);
+	} else {
+		cc_workingset_update_node(node);
+		cc_xas_rewind_refcnt(&xas);
+	}
+	cc_xas_clear_xa_node(&xas);
+	cc_xas_clear_xa_node(&cursor);
+}
+
 static enum lru_status shadow_lru_isolate(struct list_head *item,
 					  struct list_lru_one *lru,
 					  void *arg) __must_hold(lru->lock)
@@ -786,6 +814,12 @@ static enum lru_status shadow_lru_isolate(struct list_head *item,
 		}
 	}
 
+	if (cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages))) {
+		cc_workingset_clear_node((struct cc_xa_node *)node, lru);
+		ret = LRU_RETRY;
+		goto out_unlock;
+	}
+
 	list_lru_isolate(lru, item);
 	__dec_node_page_state(virt_to_page(node), WORKINGSET_NODES);
 
@@ -804,13 +838,14 @@ static enum lru_status shadow_lru_isolate(struct list_head *item,
 	mod_lruvec_kmem_state(node, WORKINGSET_NODERECLAIM, 1);
 
 out_invalid:
+	ret = LRU_REMOVED_RETRY;
+out_unlock:
 	xa_unlock_irq(&mapping->i_pages);
 	if (mapping->host != NULL) {
 		if (mapping_shrinkable(mapping))
 			inode_lru_list_add(mapping->host);
 		spin_unlock(&mapping->host->i_lock);
 	}
-	ret = LRU_REMOVED_RETRY;
 out:
 	cond_resched();
 	return ret;
