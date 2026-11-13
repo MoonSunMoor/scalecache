@@ -476,6 +476,7 @@ static void __address_space_init_once(struct address_space *mapping)
 	xa_init_flags(&mapping->i_pages, XA_FLAGS_LOCK_IRQ | XA_FLAGS_ACCOUNT);
 	init_rwsem(&mapping->i_mmap_rwsem);
 	spin_lock_init(&mapping->i_private_lock);
+	spin_lock_init(&mapping->nr_lock);
 	mapping->i_mmap = RB_ROOT_CACHED;
 }
 
@@ -756,6 +757,7 @@ void dump_mapping(const struct address_space *mapping)
 
 void clear_inode(struct inode *inode)
 {
+	unsigned long flags;
 	/*
 	 * Only IS_VERITY() inodes can have verity info, so start by checking
 	 * for IS_VERITY() (which is faster than retrieving the pointer to the
@@ -770,7 +772,10 @@ void clear_inode(struct inode *inode)
 	 * and we must not free the mapping under it.
 	 */
 	xa_lock_irq(&inode->i_data.i_pages);
+	spin_lock_irqsave(&inode->i_data.nr_lock, flags);
 	BUG_ON(inode->i_data.nrpages);
+	spin_unlock_irqrestore(&inode->i_data.nr_lock, flags);
+
 	/*
 	 * Almost always, mapping_empty(&inode->i_data) here; but there are
 	 * two known and long-standing ways in which nodes may get left behind
@@ -940,6 +945,8 @@ static enum lru_status inode_lru_isolate(struct list_head *item,
 {
 	struct list_head *freeable = arg;
 	struct inode	*inode = container_of(item, struct inode, i_lru);
+	unsigned long nrpages;
+	unsigned long flags;
 
 	/*
 	 * We are inverting the lru lock/inode->i_lock here, so use a
@@ -975,7 +982,11 @@ static enum lru_status inode_lru_isolate(struct list_head *item,
 	 * page cache in order to free up struct inodes: lowmem might
 	 * be under pressure before the cache inside the highmem zone.
 	 */
-	if (!mapping_empty(&inode->i_data)) {
+	spin_lock_irqsave(&inode->i_data.nr_lock, flags);
+	nrpages = inode->i_data.nrpages;
+	spin_unlock_irqrestore(&inode->i_data.nr_lock, flags);
+
+	if (!mapping_empty(&inode->i_data) || nrpages) {
 		unsigned long reap;
 
 		inode_pin_lru_isolating(inode);
