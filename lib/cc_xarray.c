@@ -1170,6 +1170,28 @@ static void node_set_marks(struct cc_xa_node *node, unsigned int offset,
 }
 
 /**
+ * cc_xas_try_split_min_order() - Calculate the minimum target split order.
+ * @order: Current entry order.
+ *
+ * Calculate the minimum target order for a single try_split operation
+ * requiring at most one new node.  At a chunk boundary, only one order
+ * can be removed; otherwise, splitting down to the chunk boundary needs
+ * no new nodes.  This is a pure calculation: it neither allocates memory
+ * nor splits an entry or changes the XArray.
+ *
+ * Context: Any context.
+ * Return: The minimum target order, or 0 if @order is 0.
+ */
+unsigned int cc_xas_try_split_min_order(unsigned int order)
+{
+	if (order % CC_XA_CHUNK_SHIFT == 0)
+		return order == 0 ? 0 : order - 1;
+
+	return order - (order % CC_XA_CHUNK_SHIFT);
+}
+EXPORT_SYMBOL_GPL(cc_xas_try_split_min_order);
+
+/**
  * cc_xas_split_alloc() - Allocate memory for splitting an entry.
  * @xas: XArray operation state.
  * @entry: New entry which will be stored in the array.
@@ -1298,6 +1320,152 @@ void cc_xas_split(struct cc_xa_state *xas, void *entry, unsigned int order)
 	cc_xas_rewind_refcnt(xas);
 }
 EXPORT_SYMBOL_GPL(cc_xas_split);
+
+static void __cc_xas_init_node_for_split(struct cc_xa_state *xas,
+		struct cc_xa_node *node, void *entry)
+{
+	unsigned int i;
+	void *sibling = NULL;
+	unsigned int mask = xas->xa_sibs;
+
+	node->array = xas->xa;
+	for (i = 0; i < CC_XA_CHUNK_SIZE; i++) {
+		if ((i & mask) == 0) {
+			RCU_INIT_POINTER(node->slots[i], entry);
+			sibling = cc_xa_mk_sibling(i);
+		} else {
+			RCU_INIT_POINTER(node->slots[i], sibling);
+		}
+	}
+}
+
+/**
+ * cc_xas_try_split() - Try to split a multi-index entry.
+ * @xas: XArray operation state.
+ * @entry: New entry to store in the array, not the expected old entry.
+ * @order: Current entry order.
+ *
+ * The size of the new entries is set in @xas.  The value in @entry is
+ * copied to all the replacement entries.  Use cc_xas_try_split_min_order()
+ * to select a supported target order requiring at most one new node.
+ * If a child is needed, use the first preallocated node or allocate one
+ * with GFP_NOWAIT, adding __GFP_ACCOUNT for an accounted array.
+ *
+ * Errors are recorded in @xas before any shared split mutation.  When a
+ * child is needed, -EINVAL is recorded if @order is not a chunk boundary
+ * or xa_sibs differs from (1 << ((order - 1) % CC_XA_CHUNK_SHIFT)) - 1.
+ * This is not general validation of arbitrary split orders.  Allocation
+ * failure records -ENOMEM, which can be retried with cc_xas_nomem().
+ *
+ * -EEXIST is recorded only if final revalidation, before the first shared
+ * mutation, observes that the canonical slot differs from the entry loaded
+ * by this invocation.  This does not detect later changes, sibling-only
+ * changes or ABA, and does not provide concurrent multi-slot atomicity.
+ *
+ * Success preserves unused preallocation and the cursor, consuming exactly
+ * one node for a vertical split.  Errors free only the unpublished allocation
+ * chain and release the cursor.  All exits release traversal references.
+ *
+ * As with cc_xas_split(), callers must exclude concurrent writers and garbage
+ * collection for the affected range; xa_lock alone does not exclude lockless
+ * cc_xas_store().  This API does not provide a lockless split transaction.
+ *
+ * Context: Any context.  The caller should hold the xa_lock.
+ */
+void cc_xas_try_split(struct cc_xa_state *xas, void *entry, unsigned int order)
+{
+	unsigned int sibs = (1 << (order % CC_XA_CHUNK_SHIFT)) - 1;
+	unsigned int offset, marks;
+	struct cc_xa_node *node;
+	void *curr = cc_xas_load(xas, false);
+	int values = 0;
+	int error;
+	gfp_t gfp = GFP_NOWAIT;
+
+	node = xas->xa_node;
+	if (cc_xas_top(node)) {
+		cc_xas_rewind_refcnt(xas);
+		return;
+	}
+
+	if (xas->xa->xa_flags & CC_XA_FLAGS_ACCOUNT)
+		gfp |= __GFP_ACCOUNT;
+
+	marks = node_get_marks(node, xas->xa_offset);
+	offset = xas->xa_offset + sibs;
+
+	if (xas->xa_shift < node->shift) {
+		struct cc_xa_node *child = xas->xa_alloc;
+		unsigned int expected_sibs =
+			(1 << ((order - 1) % CC_XA_CHUNK_SHIFT)) - 1;
+
+		if (sibs || xas->xa_sibs != expected_sibs) {
+			error = -EINVAL;
+			goto error;
+		}
+
+		if (!child) {
+			child = kmem_cache_alloc(radix_tree_node_cachep, gfp);
+			if (!child) {
+				error = -ENOMEM;
+				goto error;
+			}
+			RCU_INIT_POINTER(child->parent, xas->xa_alloc);
+			xas->xa_alloc = child;
+		}
+		__cc_xas_init_node_for_split(xas, child, entry);
+		child->shift = node->shift - CC_XA_CHUNK_SHIFT;
+		child->offset = offset;
+		child->count = CC_XA_CHUNK_SIZE;
+		child->nr_values = cc_xa_is_value(entry) ?
+				CC_XA_CHUNK_SIZE : 0;
+		child->refcnt = 0;
+		child->gc_flag = 0;
+		child->del = 0;
+
+		if (cc_xa_entry(xas->xa, node, xas->xa_offset) != curr) {
+			error = -EEXIST;
+			goto error;
+		}
+
+		/* Retain the chain successor before installing the live parent. */
+		xas->xa_alloc = rcu_dereference_raw(child->parent);
+		RCU_INIT_POINTER(child->parent, node);
+		node_set_marks(node, offset, child, xas->xa_sibs, marks);
+		rcu_assign_pointer(node->slots[offset], cc_xa_mk_node(child));
+		if (cc_xa_is_value(curr))
+			values--;
+		cc_xas_update(xas, child);
+	} else {
+		if (cc_xa_entry(xas->xa, node, xas->xa_offset) != curr) {
+			error = -EEXIST;
+			goto error;
+		}
+
+		do {
+			unsigned int canon = offset - xas->xa_sibs;
+
+			node_set_marks(node, canon, NULL, 0, marks);
+			rcu_assign_pointer(node->slots[canon], entry);
+			while (offset > canon)
+				rcu_assign_pointer(node->slots[offset--],
+						cc_xa_mk_sibling(canon));
+			values += (cc_xa_is_value(entry) - cc_xa_is_value(curr)) *
+					(xas->xa_sibs + 1);
+		} while (offset-- > xas->xa_offset);
+	}
+
+	__sync_fetch_and_add(&node->nr_values, values);
+	cc_xas_update(xas, node);
+	cc_xas_rewind_refcnt(xas);
+	return;
+
+error:
+	cc_xas_destroy(xas);
+	cc_xas_rewind_refcnt(xas);
+	cc_xas_set_err(xas, error);
+}
+EXPORT_SYMBOL_GPL(cc_xas_try_split);
 #endif
 
 /**
@@ -1685,7 +1853,7 @@ void *cc_xas_find_conflict(struct cc_xa_state *xas)
 }
 EXPORT_SYMBOL_GPL(cc_xas_find_conflict);
 
-void cc_xa_garbage_collect_entry(struct cc_xarray *xa, void *entry, unsigned long index, unsigned long shift, int *done)
+static void cc_xa_garbage_collect_entry(struct cc_xarray *xa, void *entry, unsigned long index, unsigned long shift, int *done)
 {
 	struct cc_xa_node *node, *parent;
 	unsigned long i;
@@ -2110,6 +2278,43 @@ unlock:
 	return result;
 }
 //EXPORT_SYMBOL(cc_xa_store_range);
+
+/**
+ * cc_xas_get_order() - Get the order of a loaded entry.
+ * @xas: XArray operation state.
+ *
+ * Call after cc_xas_load() has successfully loaded an entry.  The caller
+ * must keep @xas valid and free of errors, with xa_offset at the canonical
+ * entry rather than a sibling slot.
+ *
+ * This function only reads the existing cursor and node slots.  It does not
+ * reload the entry, change the cursor, or acquire or release node references.
+ *
+ * Return: The order of the entry, or 0 for an entry stored in the root.
+ */
+int cc_xas_get_order(struct cc_xa_state *xas)
+{
+	int order = 0;
+
+	if (!xas->xa_node)
+		return 0;
+
+	CC_XA_NODE_BUG_ON(xas->xa_node, cc_xa_is_sibling(cc_xa_entry(xas->xa,
+		       xas->xa_node, xas->xa_offset)));
+	for (;;) {
+		unsigned int slot = xas->xa_offset + (1 << order);
+
+		if (slot >= CC_XA_CHUNK_SIZE)
+			break;
+		if (!cc_xa_is_sibling(cc_xa_entry(xas->xa, xas->xa_node, slot)))
+			break;
+		order++;
+	}
+
+	order += xas->xa_node->shift;
+	return order;
+}
+EXPORT_SYMBOL_GPL(cc_xas_get_order);
 
 /**
  * cc_xa_get_order() - Get the order of an entry.
@@ -2601,7 +2806,7 @@ void cc_xa_dump_node(const struct cc_xa_node *node)
 }
 EXPORT_SYMBOL(cc_xa_dump_node);
 
-void cc_xa_dump_index(unsigned long index, unsigned int shift)
+static void cc_xa_dump_index(unsigned long index, unsigned int shift)
 {
 	if (!shift)
 		pr_info("%lu: ", index);
@@ -2611,7 +2816,7 @@ void cc_xa_dump_index(unsigned long index, unsigned int shift)
 		pr_info("%lu-%lu: ", index, index | ((1UL << shift) - 1));
 }
 
-void cc_xa_dump_entry(const void *entry, unsigned long index, unsigned long shift)
+static void cc_xa_dump_entry(const void *entry, unsigned long index, unsigned long shift)
 {
 	if (!entry)
 		return;

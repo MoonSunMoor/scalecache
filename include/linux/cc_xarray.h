@@ -1629,10 +1629,18 @@ void cc_xas_pause(struct cc_xa_state *);
 void cc_xas_create_range(struct cc_xa_state *);
 
 #ifdef CONFIG_XARRAY_MULTI
+int cc_xas_get_order(struct cc_xa_state *xas);
 int cc_xa_get_order(struct cc_xarray *, unsigned long index);
 void cc_xas_split(struct cc_xa_state *, void *entry, unsigned int order);
 void cc_xas_split_alloc(struct cc_xa_state *, void *entry, unsigned int order, gfp_t);
+void cc_xas_try_split(struct cc_xa_state *, void *entry, unsigned int order);
+unsigned int cc_xas_try_split_min_order(unsigned int order);
 #else
+static inline int cc_xas_get_order(struct cc_xa_state *xas)
+{
+	return 0;
+}
+
 static inline int cc_xa_get_order(struct cc_xarray *xa, unsigned long index)
 {
 	return 0;
@@ -1647,6 +1655,16 @@ static inline void cc_xas_split(struct cc_xa_state *xas, void *entry,
 static inline void cc_xas_split_alloc(struct cc_xa_state *xas, void *entry,
 		unsigned int order, gfp_t gfp)
 {
+}
+
+static inline void cc_xas_try_split(struct cc_xa_state *xas, void *entry,
+		unsigned int order)
+{
+}
+
+static inline unsigned int cc_xas_try_split_min_order(unsigned int order)
+{
+	return 0;
 }
 #endif
 
