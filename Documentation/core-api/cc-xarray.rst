@@ -14,6 +14,9 @@ The implementation is in ``include/linux/cc_xarray.h`` and
 This first-stage port targets order-0 page-cache operation.  Keep large
 folios disabled for CC mappings through the page-cache allocation policy,
 not by disabling ``CONFIG_TRANSPARENT_HUGEPAGE`` or ``CONFIG_XARRAY_MULTI``.
+Do not use DAX on CC mappings either: DAX stores multi-order entries with
+ordinary XArray operations.  Both stay disabled until the multi-index
+requirements in "Order and split interfaces" are met.
 The presence of split APIs is not a guarantee of concurrent large-folio
 support.  Direct flush (dflush) is separate from these tree interfaces.
 
@@ -94,11 +97,11 @@ On an exit that still owns both, capture the error, unwind traversal refs,
 then release the cursor.  Read ``cc_xas_error()`` before resetting the
 cursor.  Neither cleanup operation substitutes for the other.
 
-``cc_xas_store()``, ``cc_xas_try_split()``, ``cc_xas_split()`` and both
-shadow-clear helpers unwind traversal references on every return.
-They do not provide a general cursor-release guarantee: callers must still
-release the cursor.  ``cc_xas_try_split()`` also releases it on error,
-leaving the error encoded in the state until reset.
+``cc_xas_store()``, ``cc_xas_store_expected()``, ``cc_xas_try_split()``,
+``cc_xas_split()`` and both shadow-clear helpers unwind traversal references
+on every return.  They do not provide a general cursor-release guarantee:
+callers must still release the cursor.  ``cc_xas_try_split()`` also
+releases it on error, leaving the error encoded in the state until reset.
 
 ``cc_xas_reset()``, ``cc_xas_set()`` and ``cc_xas_set_order()`` change the
 cursor, not the retained traversal chain.  Unwind any retained chain
@@ -138,6 +141,19 @@ recorded in ``cc_xas_error(&xas)``.  Check the state even when the returned
 entry is non-NULL.  It is not an expected-old-value API: a prior load and
 comparison do not bind the store's own load/CAS to that observation.
 
+``cc_xas_store_expected(&xas, old, entry)`` is ``cc_xas_store()`` with the
+slot CAS expecting ``old``.  If the canonical slot no longer holds ``old``,
+it changes nothing and records ``-EEXIST``.  A path that checks the current
+entry and then stores, without a lock that excludes other writers, must use
+it and pass the entry it observed (``NULL`` if none).  Otherwise an
+insertion made between the check and the store is silently replaced, and
+both callers succeed.  The CC copy of ``__filemap_add_folio()`` (#5) must
+use it, passing the entry collected by its ``cc_xas_for_each_conflict()``
+scan.  This is the one intended difference from the original insertion
+code.  Paths that store over an entry they own, such as a locked folio
+whose references are frozen during deletion, replacement or migration,
+keep ``cc_xas_store()``.  Only the canonical slot is compared.
+
 ``cc_xa_store()`` and its locked wrapper instead return an encoded error
 on failure; decode it with ``cc_xa_err()``.  Do not decode an advanced
 store's returned entry as a substitute for checking its state.
@@ -151,9 +167,13 @@ For store/try-split callers, distinguish:
   required synchronization before the next attempt.
 * ``-EINVAL``: an unsupported argument or split geometry.  It is not a
   contention signal and must not be retried as one.
-* ``-EEXIST``: a mutation detected a conflicting slot value.  Return to the
-  caller's existing conflict path; do not add an unconditional retry loop
-  or translate it into ``-EAGAIN`` or a new ``-EBUSY`` convention.
+* ``-EEXIST``: a mutation lost a race for a slot, which changed between its
+  observation and the CAS.  It does not mean that the index is occupied.
+  The slot may now be empty, for example when a store into an empty head
+  loses to another thread publishing the root, or when reclaim removed the
+  observed shadow.  Return to the caller's existing conflict path, which
+  looks the index up again.  Do not add an unconditional retry loop or
+  translate it into ``-EAGAIN`` or a new ``-EBUSY`` convention.
 
 This is not a closed errno list for every CC API.  For example,
 ``__cc_xa_insert()`` retains ``-EBUSY`` for an already occupied entry.
@@ -218,9 +238,22 @@ addition to meeting the documented ``xa_lock`` requirement.  ``xa_lock``
 alone cannot exclude lockless ``cc_xas_store()``.  Neither API supplies a
 concurrent split transaction or a large-folio design.
 
-Do not assume that failing order-greater-than-zero stores or deletes roll
-back earlier slot updates.  Multi-slot rollback/atomicity is not provided
-by this first-stage port.
+Callers may rely on the following for order-greater-than-zero stores and
+deletes, and must not add compensation code:
+
+* A failed store or delete leaves no entry partially stored.  Nodes created
+  on the way may remain, as with the ordinary XArray.
+* A successful store or delete covers the whole range.
+* Other writers do not act on an intermediate state, for example by storing
+  into the wrong slot.
+
+Upstream ``xas_store()`` fails only before it changes any slot, so the
+7.2.8 originals have no compensation code.  The first-stage implementation
+does not provide these guarantees: ``cc_xas_store()`` updates the slots one
+CAS at a time and can stop part way.  The path is not executed while large
+folios and DAX stay disabled for CC mappings.  Meeting these requirements is
+a precondition for enabling either.  If they cannot be met, both stay
+disabled and this contract does not change.
 
 Shadow cleanup
 ==============
@@ -290,5 +323,23 @@ or truncate walk merely because a node became empty.
 When porting a follow-on CC copy, preserve the non-CC path and check all
 return/early-exit paths for state errors, traversal refs, cursors and
 unused allocation.  Keep mapping callbacks and page/folio ownership
-separate from tree references.  Keep large-folio policy disabled for CC
-mappings until the separate multi-slot concurrency design is integrated.
+separate from tree references.  In addition:
+
+* Match the CC copy one-to-one with the 7.2.8 original function, including
+  its large-folio code.  Do not drop order-greater-than-zero handling
+  because large folios are disabled.  First-stage tests do not exercise
+  that code; it is validated when large folios are enabled.
+* Some paths have used ``i_pages`` without a CC branch since 6.6.8, for
+  example ``page_cache_delete_batch()`` (#4) and ``__folio_end_writeback()``
+  and ``__folio_mark_dirty()`` (#13).  Check such paths when porting the
+  topic.  The list is not exhaustive.
+
+  * If an ordinary XArray operation deletes or frees CC nodes there, as
+    ``page_cache_delete_batch()`` does with ``xas_store(&xas, NULL)``, fix it
+    as a required fix: a separate commit with a reproducer, as for the
+    shadow cleanup.
+  * If it only changes marks, check it and record the result.  Fix it only
+    if a problem is reproduced.
+
+* Keep large folios and DAX disabled for CC mappings until the
+  multi-index requirements in "Order and split interfaces" are met.

@@ -8,6 +8,7 @@
  * Original Author: Matthew Wilcox <willy@infradead.org>
  *
  * See Documentation/core-api/xarray.rst for how to use the XArray.
+ * See Documentation/core-api/cc-xarray.rst for the cc_ calling conventions.
  *
  * This API retains ScaleCache's node-reference and reclamation model, not
  * the regular XArray's RCU reclamation guarantee.  Advanced callers must
