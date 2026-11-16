@@ -929,23 +929,9 @@ static void update_node(struct cc_xa_state *xas, struct cc_xa_node *node,
 		cc_xas_delete_node(xas);
 }
 
-/**
- * cc_xas_store() - Store this entry in the XArray.
- * @xas: XArray operation state.
- * @entry: New entry.
- *
- * If @xas is operating on a multi-index entry, the entry returned by this
- * function is essentially meaningless (it may be an internal entry or it
- * may be %NULL, even if there are non-NULL entries at some of the indices
- * covered by the range).  This is not a problem for any current users,
- * and can be changed if needed.
- *
- * Releases retained traversal references on every return.  The cursor and
- * error state are preserved; callers must release the cursor separately.
- *
- * Return: The old entry at this index.
- */
-void *cc_xas_store(struct cc_xa_state *xas, void *entry)
+/* Common body of cc_xas_store() and cc_xas_store_expected(). */
+static void *__cc_xas_store(struct cc_xa_state *xas, void *entry,
+			    bool expect, void *expected)
 {
 	struct cc_xa_node *node;
 	void __rcu **slot = &xas->xa->xa_head;	// slot pointer
@@ -965,6 +951,10 @@ void *cc_xas_store(struct cc_xa_state *xas, void *entry)
 
 	if (cc_xas_invalid(xas))
 		goto out;
+	if (expect && first != expected) {
+		cc_xas_set_err(xas, -EEXIST);
+		goto out;
+	}
 	node = xas->xa_node;
 	if (node && (xas->xa_shift < node->shift))
 		xas->xa_sibs = 0;
@@ -1027,7 +1017,56 @@ out:
 	cc_xas_rewind_refcnt(xas);
 	return first;
 }
+
+/**
+ * cc_xas_store() - Store this entry in the XArray.
+ * @xas: XArray operation state.
+ * @entry: New entry.
+ *
+ * If @xas is operating on a multi-index entry, the entry returned by this
+ * function is essentially meaningless (it may be an internal entry or it
+ * may be %NULL, even if there are non-NULL entries at some of the indices
+ * covered by the range).  This is not a problem for any current users,
+ * and can be changed if needed.
+ *
+ * Releases retained traversal references on every return.  The cursor and
+ * error state are preserved; callers must release the cursor separately.
+ *
+ * Return: The old entry at this index.
+ */
+void *cc_xas_store(struct cc_xa_state *xas, void *entry)
+{
+	return __cc_xas_store(xas, entry, false, NULL);
+}
 EXPORT_SYMBOL_GPL(cc_xas_store);
+
+/**
+ * cc_xas_store_expected() - Store this entry if the slot still holds @old.
+ * @xas: XArray operation state.
+ * @old: Entry the caller observed at this index, or %NULL if it saw none.
+ * @entry: New entry.
+ *
+ * Like cc_xas_store(), but the store is bound to the caller's observation:
+ * the slot CAS expects @old rather than a value reloaded by the store.  If
+ * the canonical slot no longer holds @old, nothing is changed and -EEXIST
+ * is recorded in @xas.  Use this where the caller checks the current
+ * entry (for example with cc_xas_for_each_conflict()) and then stores
+ * without a lock excluding other writers.  A concurrent insertion between
+ * the check and the store is then reported instead of silently replaced.
+ *
+ * Only the canonical slot is compared.  For a multi-index store this does
+ * not compare sibling slots or make the multi-slot update atomic.
+ *
+ * Releases retained traversal references on every return.  The cursor and
+ * error state are preserved; callers must release the cursor separately.
+ *
+ * Return: The entry found at this index (equal to @old on success).
+ */
+void *cc_xas_store_expected(struct cc_xa_state *xas, void *old, void *entry)
+{
+	return __cc_xas_store(xas, entry, true, old);
+}
+EXPORT_SYMBOL_GPL(cc_xas_store_expected);
 
 static bool cc_xas_clear_shadow_slot(struct cc_xa_state *xas,
 				     unsigned int offset, void *entry)
