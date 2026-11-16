@@ -913,9 +913,16 @@ static void update_node(struct cc_xa_state *xas, struct cc_xa_node *node,
 		}
 	}
 
-	CC_XA_NODE_BUG_ON(node, (node_count > CC_XA_CHUNK_SIZE) &&
+	/*
+	 * Slot CASes and these counter updates are separate steps, so a
+	 * concurrent update of the same node may be applied first.  Each slot
+	 * contributes at most one unapplied change, so a counter can
+	 * transiently reach 2 * CC_XA_CHUNK_SIZE.  Values near U8_MAX are
+	 * transient underflow, as before.
+	 */
+	CC_XA_NODE_BUG_ON(node, (node_count > 2 * CC_XA_CHUNK_SIZE) &&
 				(node_count < (U8_MAX - CC_XA_CHUNK_SIZE)));
-	CC_XA_NODE_BUG_ON(node, (nr_values > CC_XA_CHUNK_SIZE) &&
+	CC_XA_NODE_BUG_ON(node, (nr_values > 2 * CC_XA_CHUNK_SIZE) &&
 				(nr_values < (U8_MAX - CC_XA_CHUNK_SIZE)));
 	cc_xas_update(xas, node);
 	if (node_count <= 0 && count < 0)
