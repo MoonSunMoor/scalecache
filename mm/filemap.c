@@ -181,21 +181,29 @@ static void cc_page_cache_store(struct cc_xa_state *xas, struct folio *folio,
 	}
 }
 
-static void cc_page_cache_delete(struct address_space *mapping,
-				 struct folio *folio, void *shadow)
+static void cc_page_cache_delete_entry(struct address_space *mapping,
+				       struct folio *folio, void *shadow)
 {
 	CC_XA_STATE_ORDER(xas, CC_XARRAY(&mapping->i_pages), folio->index,
 			  folio_order(folio));
-	unsigned long flags;
 
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
 	cc_mapping_set_update(&xas, mapping);
 	cc_page_cache_store(&xas, folio, shadow);
-	cc_xas_init_marks(&xas);
+	if (shadow)
+		cc_xas_init_marks(&xas);
 	cc_xas_clear_xa_node(&xas);
 
 	folio->mapping = NULL;
 	/* Leave folio->index set: truncation lookup relies upon it */
+}
+
+static void cc_page_cache_delete(struct address_space *mapping,
+				 struct folio *folio, void *shadow)
+{
+	unsigned long flags;
+
+	cc_page_cache_delete_entry(mapping, folio, shadow);
 	spin_lock_irqsave(&mapping->nr_lock, flags);
 	mapping->nrpages -= folio_nr_pages(folio);
 	spin_unlock_irqrestore(&mapping->nr_lock, flags);
@@ -317,6 +325,26 @@ void filemap_remove_folio(struct folio *folio)
 	filemap_free_folio(mapping, folio);
 }
 
+static void cc_page_cache_delete_batch(struct address_space *mapping,
+				       struct folio_batch *fbatch)
+{
+	unsigned long flags;
+	long total_pages = 0;
+	int i;
+
+	/* Each locked folio owns its slot, including across holes in the batch. */
+	for (i = 0; i < folio_batch_count(fbatch); i++) {
+		struct folio *folio = fbatch->folios[i];
+
+		cc_page_cache_delete_entry(mapping, folio, NULL);
+		total_pages += folio_nr_pages(folio);
+	}
+
+	spin_lock_irqsave(&mapping->nr_lock, flags);
+	mapping->nrpages -= total_pages;
+	spin_unlock_irqrestore(&mapping->nr_lock, flags);
+}
+
 /*
  * page_cache_delete_batch - delete several folios from page cache
  * @mapping: the mapping to which folios belong
@@ -338,6 +366,11 @@ static void page_cache_delete_batch(struct address_space *mapping,
 	int i = 0;
 	struct folio *folio;
 	unsigned long flags;
+
+	if (cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages))) {
+		cc_page_cache_delete_batch(mapping, fbatch);
+		return;
+	}
 
 	mapping_set_update(&xas, mapping);
 	xas_for_each(&xas, folio, ULONG_MAX) {
