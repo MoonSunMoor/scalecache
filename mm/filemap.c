@@ -1107,61 +1107,122 @@ ALLOW_ERROR_INJECTION(__filemap_add_folio, ERRNO);
 noinline int __cc_filemap_add_folio(struct address_space *mapping,
 		struct folio *folio, pgoff_t index, gfp_t gfp, void **shadowp)
 {
-	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+	CC_XA_STATE_ORDER(xas, CC_XARRAY(&mapping->i_pages), index,
+			  folio_order(folio));
+	unsigned int max_order = mapping_max_folio_order(mapping);
+	unsigned int forder = folio_order(folio);
 	unsigned long flags;
+	bool huge;
+	long nr;
 	int error;
 
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
 	VM_BUG_ON_FOLIO(folio_test_swapbacked(folio), folio);
+	VM_BUG_ON_FOLIO(forder < mapping_min_folio_order(mapping), folio);
 
-	/* CC does not yet support concurrent multi-index updates. */
-	if (folio_test_large(folio) || dax_mapping(mapping))
+	/*
+	 * CC mappings currently cap max_order at zero. Enabling multi-index
+	 * mutation requires atomic range updates and exclusion of lockless
+	 * writers and physical GC. xa_lock alone does not provide exclusion.
+	 */
+	if (forder > max_order || dax_mapping(mapping))
 		return -EOPNOTSUPP;
 
 	cc_mapping_set_update(&xas, mapping);
+	VM_BUG_ON_FOLIO(index & (folio_nr_pages(folio) - 1), folio);
+	huge = folio_test_hugetlb(folio);
+	nr = folio_nr_pages(folio);
 	gfp &= GFP_RECLAIM_MASK;
-	folio_get(folio);
+	folio_ref_add(folio, nr);
 	folio->mapping = mapping;
-	folio->index = index;
+	folio->index = xas.xa_index;
 
 	for (;;) {
-		void *entry, *old = NULL;
+		void *entry, *old = NULL, *expected = NULL;
+		int order = -1;
 
 		preempt_disable();
 		local_irq_save(flags);
+		if (max_order)
+			cc_xas_lock(&xas);
+
+		/*
+		 * A multi-index store compares the canonical slot, which can
+		 * differ from the last shadow found by the conflict walk.
+		 */
+		if (forder) {
+			expected = cc_xas_load(&xas, true);
+			cc_xas_reset(&xas);
+		}
+
 		cc_xas_for_each_conflict(&xas, entry) {
+			old = entry;
 			if (!xa_is_value(entry)) {
 				cc_xas_set_err(&xas, -EEXIST);
 				goto unlock;
 			}
-			if (cc_xas_get_order(&xas)) {
+			/* A larger entry is the first and only conflict. */
+			if (order == -1)
+				order = cc_xas_get_order(&xas);
+		}
+		if (!forder)
+			expected = old;
+
+		if (old && order > 0 && order > forder) {
+			unsigned int split_order;
+
+			/* A large shadow is outside the order-0 policy. */
+			if (!max_order) {
 				cc_xas_set_err(&xas, -EINVAL);
 				goto unlock;
 			}
-			old = entry;
+
+			/* How to handle large swap entries? */
+			BUG_ON(shmem_mapping(mapping));
+			cc_xas_rewind_refcnt(&xas);
+			split_order = max(forder, cc_xas_try_split_min_order(order));
+			while (order > forder) {
+				cc_xas_set_order(&xas, index, split_order);
+				cc_xas_try_split(&xas, old, order);
+				if (cc_xas_error(&xas))
+					goto unlock;
+				order = split_order;
+				split_order = max(forder,
+					cc_xas_try_split_min_order(split_order));
+			}
+			expected = old;
 		}
 
-		/* Bind the fresh store to what the scan observed. */
+		/* Bind the fresh store to the canonical entry we observed. */
 		cc_xas_rewind_refcnt(&xas);
 		cc_xas_reset(&xas);
-		cc_xas_store_expected(&xas, old, folio);
+		cc_xas_store_expected(&xas, expected, folio);
 		if (cc_xas_error(&xas))
 			goto unlock;
 
 		spin_lock(&mapping->nr_lock);
-		mapping->nrpages++;
+		mapping->nrpages += nr;
 		spin_unlock(&mapping->nr_lock);
-		lruvec_stat_add_folio(folio, NR_FILE_PAGES);
-		if (shadowp)
+
+		/* Hugetlb pages do not participate in page cache accounting. */
+		if (!huge) {
+			lruvec_stat_mod_folio(folio, NR_FILE_PAGES, nr);
+			if (folio_test_pmd_mappable(folio))
+				lruvec_stat_mod_folio(folio, NR_FILE_THPS, nr);
+		}
+
+		if (shadowp && old)
 			*shadowp = old;
 unlock:
 		cc_xas_rewind_refcnt(&xas);
+		if (max_order)
+			cc_xas_unlock(&xas);
 		local_irq_restore(flags);
 		preempt_enable();
 
 		if (!cc_xas_nomem(&xas, gfp))
 			break;
-		cc_xas_set(&xas, index);
+		cc_xas_set_order(&xas, index, forder);
 	}
 
 	error = cc_xas_error(&xas);
@@ -1170,7 +1231,7 @@ unlock:
 		cc_xas_nomem(&xas, GFP_NOWAIT);
 		folio->mapping = NULL;
 		/* Leave folio->index set: truncation relies upon it. */
-		folio_put(folio);
+		folio_put_refs(folio, nr);
 		return error;
 	}
 
