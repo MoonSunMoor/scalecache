@@ -756,6 +756,8 @@ static inline fgf_t fgf_set_order(size_t size)
 void *filemap_get_entry(struct address_space *mapping, pgoff_t index);
 struct folio *__filemap_get_folio_mpol(struct address_space *mapping,
 		pgoff_t index, fgf_t fgf_flags, gfp_t gfp, struct mempolicy *policy);
+struct folio *__cc_filemap_get_folio(struct address_space *mapping,
+		pgoff_t index, fgf_t fgf_flags, gfp_t gfp);
 struct page *pagecache_get_page(struct address_space *mapping, pgoff_t index,
 		fgf_t fgp_flags, gfp_t gfp);
 
