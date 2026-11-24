@@ -3825,8 +3825,8 @@ static inline loff_t cc_folio_seek_hole_data(struct cc_xa_state *xas,
 	if (!ops->is_partially_uptodate)
 		return seek_data ? end : start;
 
-	/* CC mappings use order-0 folios. */
-	cc_xas_set(xas, xas->xa_index + 1);
+	/* Restart beyond the entire folio and release the CC cursor. */
+	cc_xas_set(xas, (u64)end >> PAGE_SHIFT);
 	rcu_read_unlock();
 	folio_lock(folio);
 	if (unlikely(folio->mapping != mapping))
