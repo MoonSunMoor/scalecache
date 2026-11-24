@@ -126,6 +126,9 @@
  *    ->private_lock		(zap_pte_range->block_dirty_folio)
  */
 
+static void cc_page_cache_delete(struct address_space *mapping,
+				   struct folio *folio, void *shadow);
+
 static void page_cache_delete(struct address_space *mapping,
 				   struct folio *folio, void *shadow)
 {
@@ -133,6 +136,11 @@ static void page_cache_delete(struct address_space *mapping,
 
 	XA_STATE(xas, &mapping->i_pages, folio->index);
 	long nr = 1;
+
+	if (cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages))) {
+		cc_page_cache_delete(mapping, folio, shadow);
+		return;
+	}
 
 	mapping_set_update(&xas, mapping);
 
@@ -148,6 +156,48 @@ static void page_cache_delete(struct address_space *mapping,
 	/* Leave folio->index set: truncation lookup relies upon it */
 	spin_lock_irqsave(&mapping->nr_lock, flags);
 	mapping->nrpages -= nr;
+	spin_unlock_irqrestore(&mapping->nr_lock, flags);
+}
+
+/*
+ * A locked folio owns its entry. A head expansion can move that entry
+ * into a node while the store is in progress, so retry from the root
+ * after verifying that the locked folio is still present.
+ */
+static void cc_page_cache_store(struct cc_xa_state *xas, struct folio *folio,
+				void *entry)
+{
+	int error;
+
+	for (;;) {
+		cc_xas_store(xas, entry);
+		error = cc_xas_error(xas);
+		if (!error)
+			return;
+
+		BUG_ON(error != -EEXIST);
+		BUG_ON(cc_xa_load(xas->xa, xas->xa_index) != folio);
+		cc_xas_reset(xas);
+	}
+}
+
+static void cc_page_cache_delete(struct address_space *mapping,
+				 struct folio *folio, void *shadow)
+{
+	CC_XA_STATE_ORDER(xas, CC_XARRAY(&mapping->i_pages), folio->index,
+			  folio_order(folio));
+	unsigned long flags;
+
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+	cc_mapping_set_update(&xas, mapping);
+	cc_page_cache_store(&xas, folio, shadow);
+	cc_xas_init_marks(&xas);
+	cc_xas_clear_xa_node(&xas);
+
+	folio->mapping = NULL;
+	/* Leave folio->index set: truncation lookup relies upon it */
+	spin_lock_irqsave(&mapping->nr_lock, flags);
+	mapping->nrpages -= folio_nr_pages(folio);
 	spin_unlock_irqrestore(&mapping->nr_lock, flags);
 }
 
