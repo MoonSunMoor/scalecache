@@ -462,6 +462,8 @@ mapping_max_folio_order(const struct address_space *mapping)
 {
 	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
 		return 0;
+	if (unlikely(cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages))))
+		return 0;
 	return (mapping->flags & AS_FOLIO_ORDER_MAX_MASK) >> AS_FOLIO_ORDER_MAX;
 }
 
@@ -469,6 +471,8 @@ static inline unsigned int
 mapping_min_folio_order(const struct address_space *mapping)
 {
 	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+		return 0;
+	if (unlikely(cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages))))
 		return 0;
 	return (mapping->flags & AS_FOLIO_ORDER_MIN_MASK) >> AS_FOLIO_ORDER_MIN;
 }
@@ -1284,9 +1288,12 @@ int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
 		pgoff_t index, gfp_t gfp);
 int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 		pgoff_t index, gfp_t gfp);
+int cc_filemap_add_folio(struct address_space *mapping, struct folio *folio,
+		pgoff_t index, gfp_t gfp);
 void filemap_remove_folio(struct folio *folio);
 void __filemap_remove_folio(struct folio *folio, void *shadow);
 void replace_page_cache_folio(struct folio *old, struct folio *new);
+void cc_replace_page_cache_folio(struct folio *old, struct folio *new);
 void delete_from_page_cache_batch(struct address_space *mapping,
 				  struct folio_batch *fbatch);
 bool filemap_release_folio(struct folio *folio, gfp_t gfp);
@@ -1295,6 +1302,8 @@ loff_t mapping_seek_hole_data(struct address_space *, loff_t start, loff_t end,
 
 /* Must be non-static for BPF error injection */
 int __filemap_add_folio(struct address_space *mapping, struct folio *folio,
+		pgoff_t index, gfp_t gfp, void **shadowp);
+int __cc_filemap_add_folio(struct address_space *mapping, struct folio *folio,
 		pgoff_t index, gfp_t gfp, void **shadowp);
 
 bool filemap_range_has_writeback(struct address_space *mapping,

@@ -878,6 +878,11 @@ void replace_page_cache_folio(struct folio *old, struct folio *new)
 	pgoff_t offset = old->index;
 	XA_STATE(xas, &mapping->i_pages, offset);
 
+	if (cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages))) {
+		cc_replace_page_cache_folio(old, new);
+		return;
+	}
+
 	VM_BUG_ON_FOLIO(!folio_test_locked(old), old);
 	VM_BUG_ON_FOLIO(!folio_test_locked(new), new);
 	VM_BUG_ON_FOLIO(new->mapping, new);
@@ -908,6 +913,51 @@ void replace_page_cache_folio(struct folio *old, struct folio *new)
 }
 EXPORT_SYMBOL_GPL(replace_page_cache_folio);
 
+void cc_replace_page_cache_folio(struct folio *old, struct folio *new)
+{
+	struct address_space *mapping = old->mapping;
+	void (*free_folio)(struct folio *) = mapping->a_ops->free_folio;
+	pgoff_t offset = old->index;
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), offset);
+	unsigned long flags;
+
+	VM_BUG_ON_FOLIO(!folio_test_locked(old), old);
+	VM_BUG_ON_FOLIO(!folio_test_locked(new), new);
+	VM_BUG_ON_FOLIO(new->mapping, new);
+	VM_BUG_ON_FOLIO(folio_test_large(old), old);
+	VM_BUG_ON_FOLIO(folio_test_large(new), new);
+
+	folio_get(new);
+	new->mapping = mapping;
+	new->index = offset;
+
+	mem_cgroup_replace_folio(old, new);
+
+	cc_mapping_set_update(&xas, mapping);
+	preempt_disable();
+	local_irq_save(flags);
+	cc_page_cache_store(&xas, old, new);
+	cc_xas_clear_xa_node(&xas);
+
+	old->mapping = NULL;
+	/* Hugetlb folios do not participate in page cache accounting. */
+	if (!folio_test_hugetlb(old))
+		lruvec_stat_sub_folio(old, NR_FILE_PAGES);
+	if (!folio_test_hugetlb(new))
+		lruvec_stat_add_folio(new, NR_FILE_PAGES);
+	if (folio_test_swapbacked(old))
+		lruvec_stat_sub_folio(old, NR_SHMEM);
+	if (folio_test_swapbacked(new))
+		lruvec_stat_add_folio(new, NR_SHMEM);
+	local_irq_restore(flags);
+	preempt_enable();
+
+	if (free_folio)
+		free_folio(old);
+	folio_put(old);
+}
+EXPORT_SYMBOL_GPL(cc_replace_page_cache_folio);
+
 noinline int __filemap_add_folio(struct address_space *mapping,
 		struct folio *folio, pgoff_t index, gfp_t gfp, void **shadowp)
 {
@@ -916,6 +966,9 @@ noinline int __filemap_add_folio(struct address_space *mapping,
 	long nr;
 	unsigned int forder = folio_order(folio);
 	unsigned long flags;
+
+	if (cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages)))
+		return __cc_filemap_add_folio(mapping, folio, index, gfp, shadowp);
 
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
 	VM_BUG_ON_FOLIO(folio_test_swapbacked(folio), folio);
@@ -1017,6 +1070,88 @@ error:
 	return xas_error(&xas);
 }
 ALLOW_ERROR_INJECTION(__filemap_add_folio, ERRNO);
+
+noinline int __cc_filemap_add_folio(struct address_space *mapping,
+		struct folio *folio, pgoff_t index, gfp_t gfp, void **shadowp)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+	unsigned long flags;
+	int error;
+
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+	VM_BUG_ON_FOLIO(folio_test_swapbacked(folio), folio);
+
+	/* CC does not yet support concurrent multi-index updates. */
+	if (folio_test_large(folio) || dax_mapping(mapping))
+		return -EOPNOTSUPP;
+
+	cc_mapping_set_update(&xas, mapping);
+	gfp &= GFP_RECLAIM_MASK;
+	folio_get(folio);
+	folio->mapping = mapping;
+	folio->index = index;
+
+	for (;;) {
+		void *entry, *old = NULL;
+
+		preempt_disable();
+		local_irq_save(flags);
+		cc_xas_for_each_conflict(&xas, entry) {
+			if (!xa_is_value(entry)) {
+				cc_xas_set_err(&xas, -EEXIST);
+				goto unlock;
+			}
+			if (cc_xas_get_order(&xas)) {
+				cc_xas_set_err(&xas, -EINVAL);
+				goto unlock;
+			}
+			old = entry;
+		}
+
+		/* Bind the fresh store to what the scan observed. */
+		cc_xas_rewind_refcnt(&xas);
+		cc_xas_reset(&xas);
+		cc_xas_store_expected(&xas, old, folio);
+		if (cc_xas_error(&xas))
+			goto unlock;
+
+		spin_lock(&mapping->nr_lock);
+		mapping->nrpages++;
+		spin_unlock(&mapping->nr_lock);
+		lruvec_stat_add_folio(folio, NR_FILE_PAGES);
+		if (shadowp)
+			*shadowp = old;
+unlock:
+		cc_xas_rewind_refcnt(&xas);
+		local_irq_restore(flags);
+		preempt_enable();
+
+		if (!cc_xas_nomem(&xas, gfp))
+			break;
+		cc_xas_set(&xas, index);
+	}
+
+	error = cc_xas_error(&xas);
+	cc_xas_clear_xa_node(&xas);
+	if (error) {
+		cc_xas_nomem(&xas, GFP_NOWAIT);
+		folio->mapping = NULL;
+		/* Leave folio->index set: truncation relies upon it. */
+		folio_put(folio);
+		return error;
+	}
+
+	trace_mm_filemap_add_to_page_cache(folio);
+	return 0;
+}
+ALLOW_ERROR_INJECTION(__cc_filemap_add_folio, ERRNO);
+
+int cc_filemap_add_folio(struct address_space *mapping, struct folio *folio,
+			pgoff_t index, gfp_t gfp)
+{
+	return filemap_add_folio(mapping, folio, index, gfp);
+}
+EXPORT_SYMBOL_GPL(cc_filemap_add_folio);
 
 int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 				pgoff_t index, gfp_t gfp)
