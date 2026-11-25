@@ -472,6 +472,9 @@ int filemap_flush_nr(struct address_space *mapping, long *nr_to_write)
 }
 EXPORT_SYMBOL_FOR_MODULES(filemap_flush_nr, "btrfs");
 
+static bool cc_filemap_range_has_page(struct address_space *mapping,
+				      loff_t start_byte, loff_t end_byte);
+
 /**
  * filemap_range_has_page - check if a page exists in range.
  * @mapping:           address space within which to check
@@ -490,6 +493,9 @@ bool filemap_range_has_page(struct address_space *mapping,
 	struct folio *folio;
 	XA_STATE(xas, &mapping->i_pages, start_byte >> PAGE_SHIFT);
 	pgoff_t max = end_byte >> PAGE_SHIFT;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_filemap_range_has_page(mapping, start_byte, end_byte);
 
 	if (end_byte < start_byte)
 		return false;
@@ -514,6 +520,37 @@ bool filemap_range_has_page(struct address_space *mapping,
 	return folio != NULL;
 }
 EXPORT_SYMBOL(filemap_range_has_page);
+
+static bool cc_filemap_range_has_page(struct address_space *mapping,
+				      loff_t start_byte, loff_t end_byte)
+{
+	struct folio *folio;
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), start_byte >> PAGE_SHIFT);
+	pgoff_t max = end_byte >> PAGE_SHIFT;
+
+	if (end_byte < start_byte)
+		return false;
+
+	rcu_read_lock();
+	for (;;) {
+		folio = cc_xas_find(&xas, max);
+		if (cc_xas_retry(&xas, folio))
+			continue;
+		/* Shadow entries don't count */
+		if (cc_xa_is_value(folio))
+			continue;
+		/*
+		 * We don't need to try to pin this page; we're about to
+		 * release the RCU lock anyway.  It is enough to know that
+		 * there was a page here recently.
+		 */
+		break;
+	}
+	rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
+
+	return folio != NULL;
+}
 
 static void __filemap_fdatawait_range(struct address_space *mapping,
 				     loff_t start_byte, loff_t end_byte)
@@ -2475,6 +2512,9 @@ static void shrink_readahead_size_eio(struct file_ra_state *ra)
 	ra->ra_pages /= 4;
 }
 
+static void cc_filemap_get_read_batch(struct address_space *mapping,
+		pgoff_t index, pgoff_t max, struct folio_batch *fbatch);
+
 /*
  * filemap_get_read_batch - Get a batch of folios for read
  *
@@ -2489,6 +2529,11 @@ static void filemap_get_read_batch(struct address_space *mapping,
 {
 	XA_STATE(xas, &mapping->i_pages, index);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas)) {
+		cc_filemap_get_read_batch(mapping, index, max, fbatch);
+		return;
+	}
 
 	rcu_read_lock();
 	for (folio = xas_load(&xas); folio; folio = xas_next(&xas)) {
@@ -2518,6 +2563,43 @@ retry:
 		xas_reset(&xas);
 	}
 	rcu_read_unlock();
+}
+
+static void cc_filemap_get_read_batch(struct address_space *mapping,
+		pgoff_t index, pgoff_t max, struct folio_batch *fbatch)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
+	struct folio *folio;
+
+	rcu_read_lock();
+	for (folio = cc_xas_load(&xas, true); folio; folio = cc_xas_next(&xas)) {
+		if (cc_xas_retry(&xas, folio))
+			continue;
+		if (xas.xa_index > max || cc_xa_is_value(folio))
+			break;
+		if (cc_xa_is_sibling(folio))
+			break;
+		if (!folio_try_get(folio))
+			goto retry;
+
+		if (unlikely(folio != cc_xas_reload(&xas)))
+			goto put_folio;
+
+		if (!folio_batch_add(fbatch, folio))
+			break;
+		if (!folio_test_uptodate(folio))
+			break;
+		if (folio_test_readahead(folio))
+			break;
+		cc_xas_advance(&xas, folio_next_index(folio) - 1);
+		continue;
+put_folio:
+		folio_put(folio);
+retry:
+		cc_xas_reset(&xas);
+	}
+	rcu_read_unlock();
+	cc_xas_reset(&xas);
 }
 
 static int filemap_read_folio(struct file *file, filler_t filler,
@@ -3790,6 +3872,47 @@ skip:
 	return NULL;
 }
 
+static struct folio *cc_next_uptodate_folio(struct cc_xa_state *xas,
+		struct address_space *mapping, pgoff_t end_pgoff)
+{
+	struct folio *folio = cc_xas_next_entry(xas, end_pgoff);
+	unsigned long max_idx;
+
+	do {
+		if (!folio)
+			return NULL;
+		if (cc_xas_retry(xas, folio))
+			continue;
+		if (cc_xa_is_value(folio))
+			continue;
+		if (!folio_try_get(folio))
+			continue;
+		if (folio_test_locked(folio))
+			goto skip;
+		/* Has the page moved or been split? */
+		if (unlikely(folio != cc_xas_reload(xas)))
+			goto skip;
+		if (!folio_test_uptodate(folio) || folio_test_readahead(folio))
+			goto skip;
+		if (!folio_trylock(folio))
+			goto skip;
+		if (folio->mapping != mapping)
+			goto unlock;
+		if (!folio_test_uptodate(folio))
+			goto unlock;
+		max_idx = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE);
+		if (xas->xa_index >= max_idx)
+			goto unlock;
+		return folio;
+unlock:
+		folio_unlock(folio);
+skip:
+		folio_put(folio);
+	} while ((folio = cc_xas_next_entry(xas, end_pgoff)) != NULL);
+
+	return NULL;
+}
+
 /*
  * Map page range [start_page, start_page + nr_pages) of folio.
  * start_page is gotten from start by folio_page(folio, start)
@@ -3904,6 +4027,9 @@ out:
 	return ret;
 }
 
+static vm_fault_t cc_filemap_map_pages(struct vm_fault *vmf,
+		pgoff_t start_pgoff, pgoff_t end_pgoff);
+
 vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 			     pgoff_t start_pgoff, pgoff_t end_pgoff)
 {
@@ -3917,6 +4043,9 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 	vm_fault_t ret = 0;
 	unsigned long rss = 0;
 	unsigned int nr_pages = 0, folio_type;
+
+	if (cc_xas_is_ccxarray(&xas))
+		return cc_filemap_map_pages(vmf, start_pgoff, end_pgoff);
 
 	/*
 	 * Recalculate end_pgoff based on file_end before calling
@@ -4009,6 +4138,112 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL(filemap_map_pages);
+
+static vm_fault_t cc_filemap_map_pages(struct vm_fault *vmf,
+		pgoff_t start_pgoff, pgoff_t end_pgoff)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct file *file = vma->vm_file;
+	struct address_space *mapping = file->f_mapping;
+	pgoff_t file_end, last_pgoff = start_pgoff;
+	unsigned long addr;
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), start_pgoff);
+	struct folio *folio;
+	vm_fault_t ret = 0;
+	unsigned long rss = 0;
+	unsigned int nr_pages = 0, folio_type;
+
+	/*
+	 * Recalculate end_pgoff based on file_end before calling
+	 * next_uptodate_folio() to avoid races with concurrent
+	 * truncation.
+	 */
+	file_end = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE) - 1;
+	end_pgoff = min(end_pgoff, file_end);
+
+	rcu_read_lock();
+	folio = cc_next_uptodate_folio(&xas, mapping, end_pgoff);
+	if (!folio)
+		goto out;
+
+	/*
+	 * Do not allow to map with PMD across i_size to preserve
+	 * SIGBUS semantics.
+	 *
+	 * Make an exception for shmem/tmpfs that for long time
+	 * intentionally mapped with PMDs across i_size.
+	 */
+	if ((file_end >= folio_next_index(folio) || shmem_mapping(mapping)) &&
+	    filemap_map_pmd(vmf, folio, start_pgoff)) {
+		ret = VM_FAULT_NOPAGE;
+		goto out;
+	}
+
+	addr = vma->vm_start + ((start_pgoff - vma->vm_pgoff) << PAGE_SHIFT);
+	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, addr, &vmf->ptl);
+	if (!vmf->pte) {
+		folio_unlock(folio);
+		folio_put(folio);
+		goto out;
+	}
+
+	folio_type = mm_counter_file(folio);
+	do {
+		unsigned long end;
+		vm_fault_t map_ret;
+
+		addr += (xas.xa_index - last_pgoff) << PAGE_SHIFT;
+		vmf->pte += xas.xa_index - last_pgoff;
+		last_pgoff = xas.xa_index;
+		end = folio_next_index(folio) - 1;
+		nr_pages = min(end, end_pgoff) - xas.xa_index + 1;
+
+		if (!folio_test_large(folio)) {
+			map_ret = filemap_map_order0_folio(vmf, folio, addr,
+							   &rss);
+		} else {
+			unsigned long start = xas.xa_index - folio->index;
+
+			map_ret = filemap_map_folio_range(vmf, folio, start,
+							  addr, nr_pages, &rss,
+							  file_end);
+		}
+		ret |= map_ret;
+
+		/*
+		 * If there are too many folios that are recently evicted
+		 * in a file, they will probably continue to be evicted.
+		 * In such situation, read-ahead is only a waste of IO.
+		 * Don't decrease mmap_miss in this scenario to make sure
+		 * we can stop read-ahead.
+		 *
+		 * VM_SEQ_READ and VM_EXEC mappings skip the mmap_miss
+		 * increment in do_sync_mmap_readahead(), so skip the
+		 * decrement here as well to keep the counter symmetric.
+		 */
+		if ((map_ret & VM_FAULT_NOPAGE) &&
+		    !(vmf->flags & FAULT_FLAG_TRIED) &&
+		    !folio_test_workingset(folio) &&
+		    !(vma->vm_flags & (VM_SEQ_READ | VM_EXEC))) {
+			unsigned short mmap_miss;
+
+			mmap_miss = READ_ONCE(file->f_ra.mmap_miss);
+			if (mmap_miss)
+				WRITE_ONCE(file->f_ra.mmap_miss,
+					   mmap_miss - 1);
+		}
+
+		folio_unlock(folio);
+	} while ((folio = cc_next_uptodate_folio(&xas, mapping, end_pgoff)) != NULL);
+	add_mm_counter(vma->vm_mm, folio_type, rss);
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	trace_mm_filemap_map_pages(mapping, start_pgoff, end_pgoff);
+out:
+	rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
+
+	return ret;
+}
 
 vm_fault_t filemap_page_mkwrite(struct vm_fault *vmf)
 {
@@ -4610,6 +4845,9 @@ out:
 EXPORT_SYMBOL_GPL(filemap_invalidate_inode);
 
 #ifdef CONFIG_CACHESTAT_SYSCALL
+static void cc_filemap_cachestat(struct address_space *mapping,
+		pgoff_t first_index, pgoff_t last_index, struct cachestat *cs);
+
 /**
  * filemap_cachestat() - compute the page cache statistics of a mapping
  * @mapping:	The mapping to compute the statistics for.
@@ -4627,6 +4865,11 @@ static void filemap_cachestat(struct address_space *mapping,
 {
 	XA_STATE(xas, &mapping->i_pages, first_index);
 	struct folio *folio;
+
+	if (cc_xas_is_ccxarray(&xas)) {
+		cc_filemap_cachestat(mapping, first_index, last_index, cs);
+		return;
+	}
 
 	/* Flush stats (and potentially sleep) outside the RCU read section. */
 	mem_cgroup_flush_stats_ratelimited(NULL);
@@ -4716,6 +4959,103 @@ resched:
 		}
 	}
 	rcu_read_unlock();
+}
+
+static void cc_filemap_cachestat(struct address_space *mapping,
+		pgoff_t first_index, pgoff_t last_index, struct cachestat *cs)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), first_index);
+	struct folio *folio;
+
+	/* Flush stats (and potentially sleep) outside the RCU read section. */
+	mem_cgroup_flush_stats_ratelimited(NULL);
+
+	rcu_read_lock();
+	cc_xas_for_each(&xas, folio, last_index) {
+		int order;
+		unsigned long nr_pages;
+		pgoff_t folio_first_index, folio_last_index;
+
+		/*
+		 * Don't deref the folio. It is not pinned, and might
+		 * get freed (and reused) underneath us.
+		 *
+		 * We *could* pin it, but that would be expensive for
+		 * what should be a fast and lightweight syscall.
+		 *
+		 * Instead, derive all information of interest from
+		 * the rcu-protected xarray.
+		 */
+
+		if (cc_xas_retry(&xas, folio))
+			continue;
+
+		order = cc_xas_get_order(&xas);
+		nr_pages = 1 << order;
+		folio_first_index = round_down(xas.xa_index, 1 << order);
+		folio_last_index = folio_first_index + nr_pages - 1;
+
+		/* Folios might straddle the range boundaries, only count covered pages */
+		if (folio_first_index < first_index)
+			nr_pages -= first_index - folio_first_index;
+
+		if (folio_last_index > last_index)
+			nr_pages -= folio_last_index - last_index;
+
+		if (cc_xa_is_value(folio)) {
+			/* page is evicted */
+			void *shadow = (void *)folio;
+			bool workingset; /* not used */
+
+			cs->nr_evicted += nr_pages;
+
+#ifdef CONFIG_SWAP /* implies CONFIG_MMU */
+			if (shmem_mapping(mapping)) {
+				/* shmem file - in swap cache */
+				swp_entry_t swp = radix_to_swp_entry(folio);
+
+				/* swapin error results in poisoned entry */
+				if (!softleaf_is_swap(swp))
+					goto resched;
+
+				/*
+				 * Getting a swap entry from the shmem
+				 * inode means we beat
+				 * shmem_unuse(). rcu_read_lock()
+				 * ensures swapoff waits for us before
+				 * freeing the swapper space. However,
+				 * we can race with swapping and
+				 * invalidation, so there might not be
+				 * a shadow in the swapcache (yet).
+				 */
+				shadow = swap_cache_get_shadow(swp);
+				if (!shadow)
+					goto resched;
+			}
+#endif
+			if (workingset_test_recent(shadow, true, &workingset, false))
+				cs->nr_recently_evicted += nr_pages;
+
+			goto resched;
+		}
+
+		/* page is in cache */
+		cs->nr_cache += nr_pages;
+
+		if (cc_xas_get_mark(&xas, PAGECACHE_TAG_DIRTY))
+			cs->nr_dirty += nr_pages;
+
+		if (cc_xas_get_mark(&xas, PAGECACHE_TAG_WRITEBACK))
+			cs->nr_writeback += nr_pages;
+
+resched:
+		if (need_resched()) {
+			cc_xas_pause(&xas);
+			cond_resched_rcu();
+		}
+	}
+	rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
 }
 
 /*
