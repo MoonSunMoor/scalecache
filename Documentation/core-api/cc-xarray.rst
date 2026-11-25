@@ -118,6 +118,12 @@ reload its current slot: calling load again is not necessarily a new
 root-to-leaf walk.  Use ``cc_xas_set()`` after unwinding when a fresh walk
 is required, as for the shadow-clear helpers.
 
+The ``cc_xas_find*()`` and ``cc_xas_for_each*()`` walks move the cursor
+reference along with the cursor.  A walk that stops because it passed its
+maximum index can return ``NULL`` with the cursor still on a leaf.
+Release the cursor after the loop, as ``cc_tag_pages_for_writeback()``
+does.
+
 Node references protect the CC traversal; they do not acquire a page or
 folio reference.  Keep the enclosing mapping alive and apply the caller's
 existing page/folio reference acquisition and revalidation protocol.
@@ -330,16 +336,21 @@ separate from tree references.  In addition:
   because large folios are disabled.  First-stage tests do not exercise
   that code; it is validated when large folios are enabled.
 * Some paths have used ``i_pages`` without a CC branch since 6.6.8, for
-  example ``page_cache_delete_batch()`` (#4) and ``__folio_end_writeback()``
-  and ``__folio_mark_dirty()`` (#13).  Check such paths when porting the
-  topic.  The list is not exhaustive.
+  example ``page_cache_delete_batch()`` (#4).  Check such paths when
+  porting the topic.  The list is not exhaustive.
 
   * If an ordinary XArray operation deletes or frees CC nodes there, as
     ``page_cache_delete_batch()`` does with ``xas_store(&xas, NULL)``, fix it
     as a required fix: a separate commit with a reproducer, as for the
-    shadow cleanup.
-  * If it only changes marks, check it and record the result.  Fix it only
-    if a problem is reproduced.
+    shadow cleanup.  If the 5.4 original had a CC version, name it too.
+  * If it only changes marks and the 5.4 original had a CC version of the
+    path, restore that version in a separate commit that names the 5.4
+    file and function.  A reproducer is not required.
+    ``__folio_mark_dirty()`` and ``__folio_end_writeback()`` (#13) were
+    restored this way: they change the mark with ``__cc_xa_set_mark()``
+    or ``__cc_xa_clear_mark()`` under ``xa_lock``, as 5.4 did.
+  * If it only changes marks and 5.4 had no CC version, check it and
+    record the result.  Fix it only if a problem is reproduced.
 
 * Keep large folios and DAX disabled for CC mappings until the
   multi-index requirements in "Order and split interfaces" are met.
