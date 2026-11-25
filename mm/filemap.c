@@ -2571,7 +2571,7 @@ static void cc_filemap_get_read_batch(struct address_space *mapping,
 	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
 	struct folio *folio;
 
-	//rcu_read_lock();
+	rcu_read_lock();
 	for (folio = cc_xas_load(&xas, true); folio; folio = cc_xas_next(&xas)) {
 		if (cc_xas_retry(&xas, folio))
 			continue;
@@ -2598,7 +2598,7 @@ put_folio:
 retry:
 		cc_xas_reset(&xas);
 	}
-	// rcu_read_unlock();
+	rcu_read_unlock();
 	cc_xas_reset(&xas);
 }
 
@@ -4161,7 +4161,7 @@ static vm_fault_t cc_filemap_map_pages(struct vm_fault *vmf,
 	file_end = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE) - 1;
 	end_pgoff = min(end_pgoff, file_end);
 
-	//rcu_read_lock();
+	rcu_read_lock();
 	folio = cc_next_uptodate_folio(&xas, mapping, end_pgoff);
 	if (!folio)
 		goto out;
@@ -4239,7 +4239,7 @@ static vm_fault_t cc_filemap_map_pages(struct vm_fault *vmf,
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
 	trace_mm_filemap_map_pages(mapping, start_pgoff, end_pgoff);
 out:
-	//rcu_read_unlock();
+	rcu_read_unlock();
 	cc_xas_clear_xa_node(&xas);
 
 	return ret;
@@ -4970,7 +4970,7 @@ static void cc_filemap_cachestat(struct address_space *mapping,
 	/* Flush stats (and potentially sleep) outside the RCU read section. */
 	mem_cgroup_flush_stats_ratelimited(NULL);
 
-	//rcu_read_lock();
+	rcu_read_lock();
 	cc_xas_for_each(&xas, folio, last_index) {
 		int order;
 		unsigned long nr_pages;
@@ -5054,7 +5054,7 @@ resched:
 			cond_resched_rcu();
 		}
 	}
-	//rcu_read_unlock();
+	rcu_read_unlock();
 	cc_xas_clear_xa_node(&xas);
 }
 
