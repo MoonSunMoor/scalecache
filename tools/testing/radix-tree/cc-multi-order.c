@@ -368,6 +368,200 @@ static void counted(struct cc_xa_node *node)
 	EXPECT(!node->refcnt);
 }
 
+static void split_alone(void)
+{
+	struct cc_xa_node *node = begin("split-alone");
+	unsigned long i;
+
+	if (insert(BASE, ORDER, SHADOW))
+		abort();
+	show_split("before split", node);
+	counted(node);
+	EXPECT(!split());
+	show_split("after split", node);
+	for (i = 0; i < NR; i++)
+		EXPECT(node->slots[BASE + i] == SHADOW);
+	counted(node);
+	EXPECT(!replace_shadow(BASE + 1, &other));
+	EXPECT(cc_xa_load(XA, BASE + 1) == &other);
+	counted(node);
+	end();
+}
+
+/* A second inserter: split the shadow, then take one index of it. */
+static void store_other(void)
+{
+	int err = split();
+
+	if (err && err != -EEXIST)
+		abort();
+	other_err = replace_shadow(other_index, &other);
+}
+
+/* "Other writers do not act on an intermediate state." */
+static void split_meets_store(void)
+{
+	unsigned int write;
+	unsigned long at, i;
+	bool ran = true;
+
+	for (write = 0; ran; write++) {
+		for (at = 0; at < NR; at++) {
+			char name[64];
+			struct cc_xa_node *node;
+			int err;
+
+			snprintf(name, sizeof(name),
+				 "split-meets-store write=%u store=%lu",
+				 write, BASE + at);
+			node = begin(name);
+			if (insert(BASE, ORDER, SHADOW))
+				abort();
+			arm(node, write, at);
+			intruder = store_other;
+			err = split();
+			ran = fired();
+			show_split("after split", node);
+			printf("  split error %d, store error %d\n", err,
+			       other_err);
+			if (ran) {
+				EXPECT(err == 0 || err == -EEXIST);
+				/* The second inserter's folio must survive. */
+				EXPECT(!other_err);
+				for (i = 0; i < NR; i++) {
+					void *want = SHADOW;
+
+					if (!other_err && i == at)
+						want = &other;
+					EXPECT(cc_xa_load(XA, BASE + i) ==
+					       want);
+				}
+				counted(node);
+			}
+			end();
+		}
+	}
+}
+
+/* Reclaim or truncate removes the whole shadow. */
+static void erase_shadow(void)
+{
+	other_err = erase(BASE, ORDER);
+}
+
+/* "A successful store or delete covers the whole range." */
+static void split_meets_delete(void)
+{
+	unsigned int write;
+	unsigned long i;
+	bool ran = true;
+
+	for (write = 0; ran; write++) {
+		char name[64];
+		struct cc_xa_node *node;
+		int err;
+
+		snprintf(name, sizeof(name), "split-meets-delete write=%u",
+			 write);
+		node = begin(name);
+		if (insert(BASE, ORDER, SHADOW))
+			abort();
+		arm(node, write, 0);
+		intruder = erase_shadow;
+		err = split();
+		ran = fired();
+		show_split("after split", node);
+		printf("  split error %d, delete error %d\n", err, other_err);
+		if (ran) {
+			EXPECT(err == 0 || err == -EEXIST);
+			EXPECT(!other_err);
+			for (i = 0; i < NR; i++) {
+				void *entry = cc_xa_load(XA, BASE + i);
+
+				EXPECT(!entry || entry == SHADOW);
+			}
+			counted(node);
+		}
+		end();
+	}
+}
+
+/*
+ * A multi-index shadow has no owner.  While one writer works on its sibling
+ * slots, another replaces it with a folio of the same range in one CAS of the
+ * canonical slot, and the sibling slots now belong to that folio.
+ */
+static void evict_big(void)
+{
+	CC_XA_STATE_ORDER(xas, XA, BASE, ORDER);
+
+	if (insert(BASE, ORDER, &big))
+		abort();
+	cc_xas_store(&xas, SHADOW);
+	if (cc_xas_error(&xas))
+		abort();
+	cc_xas_clear_xa_node(&xas);
+}
+
+static void refault_other(void)
+{
+	CC_XA_STATE_ORDER(xas, XA, BASE, ORDER);
+
+	cc_xas_store_expected(&xas, SHADOW, &other);
+	other_err = cc_xas_error(&xas);
+	cc_xas_clear_xa_node(&xas);
+}
+
+static void shadow_meets_refault(bool splitting)
+{
+	unsigned int write;
+	unsigned long i;
+	bool ran = true;
+
+	for (write = 0; ran; write++) {
+		CC_XA_STATE_ORDER(xas, XA, BASE, ORDER);
+		char name[64];
+		struct cc_xa_node *node;
+		int err;
+
+		snprintf(name, sizeof(name), "shadow-%s-meets-refault write=%u",
+			 splitting ? "split" : "delete", write);
+		node = begin(name);
+		evict_big();
+		arm(node, write, 0);
+		intruder = refault_other;
+		if (splitting) {
+			err = split();
+		} else {
+			cc_xas_store_expected(&xas, SHADOW, NULL);
+			err = cc_xas_error(&xas);
+			cc_xas_clear_xa_node(&xas);
+		}
+		ran = fired();
+		show_split("after", node);
+		printf("  error %d, refault error %d\n", err, other_err);
+		if (ran) {
+			EXPECT(err == 0 || err == -EEXIST);
+			EXPECT(other_err == 0 || other_err == -EEXIST);
+			/* A folio that was stored covers its whole range. */
+			for (i = 0; i < NR && !other_err; i++)
+				EXPECT(cc_xa_load(XA, BASE + i) == &other);
+			counted(node);
+		}
+		end();
+	}
+}
+
+static void shadow_delete_meets_refault(void)
+{
+	shadow_meets_refault(false);
+}
+
+static void shadow_split_meets_refault(void)
+{
+	shadow_meets_refault(true);
+}
+
 /* A second inserter takes one index, whatever it finds there. */
 static void take_index(void)
 {
@@ -379,6 +573,45 @@ static void take_index(void)
 	for (i = 0; i < NR; i++) {
 		if (BASE + i != other_index && peek(BASE + i) == &other)
 			wrong_index = true;
+	}
+}
+
+/* The owner of a folio splits it, as mm/huge_memory.c does. */
+static void folio_split_meets_insert(void)
+{
+	unsigned int write;
+	unsigned long at, i;
+	bool ran = true;
+
+	for (write = 0; ran; write++) {
+		for (at = 0; at < NR; at++) {
+			char name[64];
+			struct cc_xa_node *node;
+			int err;
+
+			snprintf(name, sizeof(name),
+				 "folio-split-meets-insert write=%u insert=%lu",
+				 write, BASE + at);
+			node = begin(name);
+			if (insert(BASE, ORDER, &big))
+				abort();
+			arm(node, write, at);
+			intruder = take_index;
+			err = split_entry(&big);
+			ran = fired();
+			if (!ran)
+				other_err = -EEXIST;
+			show("after split", node);
+			printf("  split error %d, insert error %d\n", err,
+			       other_err);
+			EXPECT(!err);
+			EXPECT(other_err == -EEXIST);
+			EXPECT(!wrong_index);
+			for (i = 0; i < NR; i++)
+				EXPECT(node->slots[BASE + i] == &big);
+			counted(node);
+			end();
+		}
 	}
 }
 
@@ -561,6 +794,67 @@ static void far_alone(void)
 		EXPECT(holds(FAR, nr, NULL) == nr);
 		end();
 	}
+}
+
+/* The owner splits, one step at a time as mm/huge_memory.c does. */
+static void far_split(void)
+{
+	CC_XA_STATE(xas, XA, FAR + 70);
+	unsigned int order = 8, next;
+	unsigned long i;
+
+	begin("far-split");
+	EXPECT(!insert(FAR, order, &big));
+	while (order) {
+		next = cc_xas_try_split_min_order(order);
+		cc_xas_set_order(&xas, FAR + 70, next);
+		cc_xas_try_split(&xas, &big, order);
+		EXPECT(!cc_xas_error(&xas));
+		cc_xas_clear_xa_node(&xas);
+		order = next;
+	}
+	EXPECT(holds(FAR, 256, &big) == 256);
+	EXPECT(cc_xa_get_order(XA, FAR + 70) == 0);
+	far_counted(256);
+	/* Each index of the split leaf can now go on its own. */
+	EXPECT(!erase(FAR + 70, 0));
+	EXPECT(!cc_xa_load(XA, FAR + 70));
+	EXPECT(cc_xa_load(XA, FAR + 71) == &big);
+	for (i = 64; i < 128; i++)
+		if (i != 70)
+			EXPECT(!erase(FAR + i, 0));
+
+	/* A uniform split reaches every leaf. */
+	cc_xas_set_order(&xas, FAR, 0);
+	cc_xas_split(&xas, &big, 6);
+	EXPECT(!cc_xas_error(&xas));
+	cc_xas_clear_xa_node(&xas);
+	EXPECT(cc_xa_get_order(XA, FAR + 1) == 0);
+	EXPECT(holds(FAR, 64, &big) == 64);
+	cc_xas_set_order(&xas, FAR + 128, 2);
+	cc_xas_split(&xas, &big, 7);
+	EXPECT(!cc_xas_error(&xas));
+	cc_xas_clear_xa_node(&xas);
+	EXPECT(cc_xa_get_order(XA, FAR + 128) == 2);
+	EXPECT(cc_xa_get_order(XA, FAR + 252) == 2);
+
+	/* A split that has nothing to do still drops the references. */
+	{
+		CC_XA_STATE_ORDER(far, XA, (FAR + 64), CC_XA_CHUNK_SHIFT);
+
+		EXPECT(!store_order(FAR + 64, CC_XA_CHUNK_SHIFT, &big));
+		cc_xas_load(&far, false);
+		cc_xas_try_split(&far, &big, CC_XA_CHUNK_SHIFT);
+		EXPECT(!cc_xas_error(&far));
+		cc_xas_clear_xa_node(&far);
+		cc_xas_load(&far, false);
+		cc_xas_split(&far, &big, CC_XA_CHUNK_SHIFT);
+		EXPECT(!cc_xas_error(&far));
+		cc_xas_clear_xa_node(&far);
+	}
+	EXPECT(holds(FAR + 128, 128, &big) == 128);
+	far_counted(256);
+	end();
 }
 
 static unsigned int walk_marked(unsigned long start, void **seen)
@@ -1251,8 +1545,15 @@ int main(int argc, char **argv)
 		{ "alone", alone },
 		{ "store-meets-insert", store_meets_insert },
 		{ "delete-meets-insert", delete_meets_insert },
+		{ "split-alone", split_alone },
+		{ "split-meets-store", split_meets_store },
+		{ "split-meets-delete", split_meets_delete },
+		{ "folio-split-meets-insert", folio_split_meets_insert },
 		{ "evict-meets-insert", evict_meets_insert },
+		{ "shadow-delete-meets-refault", shadow_delete_meets_refault },
+		{ "shadow-split-meets-refault", shadow_split_meets_refault },
 		{ "far-alone", far_alone },
+		{ "far-split", far_split },
 		{ "far-store-meets-insert", far_store_meets_insert },
 		{ "far-delete-meets-insert", far_delete_meets_insert },
 		{ "far-nomem", far_nomem },

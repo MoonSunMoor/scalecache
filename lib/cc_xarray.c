@@ -1981,6 +1981,55 @@ static void node_set_marks(struct cc_xa_node *node, unsigned int offset,
 	}
 }
 
+/*
+ * Split the entry @curr at the cursor, which covers @sibs further slots of
+ * @node, into entries of the order in @xas that hold @entry.
+ *
+ * Pieces are taken from the last to the first, the canonical slot of a piece
+ * before its siblings, so a sibling always refers to a slot that holds its
+ * entry.  Every slot is taken from the exact value that made it part of
+ * @curr.  A slot that holds anything else has left the entry (another split,
+ * a delete or a store got there first) and is skipped.
+ *
+ * Return: false if the canonical slot no longer held @curr.  Pieces split off
+ * before that stay; they hold @entry.
+ */
+static bool cc_xas_split_slots(struct cc_xa_state *xas,
+			       struct cc_xa_node *node, void *curr,
+			       void *entry, unsigned int sibs,
+			       unsigned int marks, int *values)
+{
+	unsigned int first = xas->xa_offset;
+	unsigned int canon = first + sibs - xas->xa_sibs;
+	void *old = cc_xa_mk_sibling(first);
+	int delta = cc_xa_is_value(entry) - cc_xa_is_value(curr);
+	unsigned int i;
+
+	/* A value is never multi-index, so there is nothing to split. */
+	if (cc_xa_is_value(curr))
+		return true;
+
+	for (;; canon -= xas->xa_sibs + 1) {
+		void *expect = canon == first ? curr : old;
+
+		if (__sync_val_compare_and_swap(&node->slots[canon], expect,
+						entry) != expect) {
+			if (canon == first)
+				return false;
+			continue;
+		}
+		node_set_marks(node, canon, NULL, 0, marks);
+		*values += delta;
+		for (i = canon + xas->xa_sibs; i > canon; i--) {
+			if (__sync_val_compare_and_swap(&node->slots[i], old,
+					cc_xa_mk_sibling(canon)) == old)
+				*values += delta;
+		}
+		if (canon == first)
+			return true;
+	}
+}
+
 /**
  * cc_xas_try_split_min_order() - Calculate the minimum target split order.
  * @order: Current entry order.
@@ -2010,272 +2059,139 @@ EXPORT_SYMBOL_GPL(cc_xas_try_split_min_order);
  * @order: Current entry order.
  * @gfp: Memory allocation flags.
  *
- * This function should be called before calling cc_xas_split().
- * If necessary, it will allocate new nodes (and fill them with @entry)
- * to prepare for the upcoming split of an entry of @order size into
- * entries of the order stored in the @xas.
+ * A cc entry lives in leaf nodes only, so a split never needs a new node and
+ * this function has nothing to allocate.  It exists so that a caller copied
+ * from the ordinary XArray keeps its shape.
  *
- * Context: May sleep if @gfp flags permit.
+ * Context: Any context.
  */
 void cc_xas_split_alloc(struct cc_xa_state *xas, void *entry, unsigned int order,
 		gfp_t gfp)
 {
-	unsigned int sibs = (1 << (order % CC_XA_CHUNK_SHIFT)) - 1;
-	unsigned int mask = xas->xa_sibs;
-
-	/* XXX: no support for splitting really large entries yet */
-	if (WARN_ON(xas->xa_shift + 2 * CC_XA_CHUNK_SHIFT <= order))
-		goto nomem;
-	if (xas->xa_shift + CC_XA_CHUNK_SHIFT > order)
-		return;
-
-	if (xas->xa->xa_flags & CC_XA_FLAGS_ACCOUNT)
-		gfp |= __GFP_ACCOUNT;
-
-	do {
-		unsigned int i;
-		void *sibling;
-		struct cc_xa_node *node;
-
-		node = kmem_cache_alloc(radix_tree_node_cachep, gfp);
-		if (!node)
-			goto nomem;
-		node->array = xas->xa;
-		node->refcnt = 0;
-		node->gc_flag = 0;
-		node->del = 0;
-		for (i = 0; i < CC_XA_CHUNK_SIZE; i++) {
-			if ((i & mask) == 0) {
-				RCU_INIT_POINTER(node->slots[i], entry);
-				sibling = cc_xa_mk_sibling(0);
-			} else {
-				RCU_INIT_POINTER(node->slots[i], sibling);
-			}
-		}
-		RCU_INIT_POINTER(node->parent, xas->xa_alloc);
-		xas->xa_alloc = node;
-	} while (sibs-- > 0);
-
-	return;
-nomem:
-	cc_xas_destroy(xas);
-	cc_xas_set_err(xas, -ENOMEM);
 }
 EXPORT_SYMBOL_GPL(cc_xas_split_alloc);
+
+/*
+ * Split the entry at the cursor index within its leaf.  @sibs is the number
+ * of further slots that the entry covers in that leaf.
+ */
+static void cc_xas_split_leaf(struct cc_xa_state *xas, void *entry,
+			      unsigned int sibs)
+{
+	void *curr = cc_xas_load(xas, false);
+	struct cc_xa_node *node = xas->xa_node;
+	unsigned int marks;
+	int values = 0;
+	bool done;
+
+	if (cc_xas_top(node)) {
+		cc_xas_rewind_refcnt(xas);
+		return;
+	}
+
+	/*
+	 * Without a lock the entry loaded here need not be the one the
+	 * caller looked at.  Split only what the caller names.
+	 */
+	done = curr == entry;
+	if (done) {
+		marks = node_get_marks(node, xas->xa_offset);
+		done = cc_xas_split_slots(xas, node, curr, entry, sibs, marks,
+					  &values);
+		__sync_fetch_and_add(&node->nr_values, values);
+		cc_xas_update(xas, node);
+	}
+	cc_xas_rewind_refcnt(xas);
+	if (!done) {
+		cc_xas_destroy(xas);
+		cc_xas_set_err(xas, -EEXIST);
+	}
+}
 
 /**
  * cc_xas_split() - Split a multi-index entry into smaller entries.
  * @xas: XArray operation state.
- * @entry: New entry to store in the array.
+ * @entry: The entry to split, which is also stored in the smaller entries.
  * @order: Current entry order.
  *
- * The size of the new entries is set in @xas.  The value in @entry is
- * copied to all the replacement entries.
+ * The size of the new entries is set in @xas.  Every slot is changed with a
+ * CAS from the value that made it part of the entry, so the split does not
+ * overwrite another writer.  -EEXIST is recorded if a canonical slot does
+ * not hold @entry.  The caller must own the entry, as the holder of a folio
+ * lock does.
  *
- * Unlike the single-slot CAS stores, splitting updates multiple slots.
- * Callers must exclude concurrent writers and garbage collection for the
- * affected range; xa_lock alone does not exclude lockless cc_xas_store().
- * This API does not provide a lockless split transaction.
+ * An entry of a leaf or more is one entry per leaf.  Splitting it into
+ * pieces of a leaf or more changes nothing; otherwise each of its leaves is
+ * split.
  *
- * Context: Any context.  The caller should hold the xa_lock.
+ * Context: Any context.
  */
 void cc_xas_split(struct cc_xa_state *xas, void *entry, unsigned int order)
 {
-	unsigned int sibs = (1 << (order % CC_XA_CHUNK_SHIFT)) - 1;
-	unsigned int offset, marks;
-	struct cc_xa_node *node;
-	void *curr = cc_xas_load(xas, false);
-	int values = 0;
+	unsigned long index = xas->xa_index;
+	unsigned long base, leaves, i;
 
-	node = xas->xa_node;
-	if (cc_xas_top(node)) {
+	if (xas->xa_shift >= CC_XA_CHUNK_SHIFT) {
 		cc_xas_rewind_refcnt(xas);
 		return;
 	}
+	if (order < CC_XA_CHUNK_SHIFT) {
+		cc_xas_split_leaf(xas, entry, (1U << order) - 1);
+		return;
+	}
 
-	marks = node_get_marks(node, xas->xa_offset);
-
-	offset = xas->xa_offset + sibs;
-	do {
-		if (xas->xa_shift < node->shift) {
-			struct cc_xa_node *child = xas->xa_alloc;
-
-			xas->xa_alloc = rcu_dereference_raw(child->parent);
-			child->shift = node->shift - CC_XA_CHUNK_SHIFT;
-			child->offset = offset;
-			child->count = CC_XA_CHUNK_SIZE;
-			child->nr_values = cc_xa_is_value(entry) ?
-					CC_XA_CHUNK_SIZE : 0;
-			child->refcnt = 0;
-			child->gc_flag = 0;
-			child->del = 0;
-			RCU_INIT_POINTER(child->parent, node);
-			node_set_marks(node, offset, child, xas->xa_sibs, marks);
-			rcu_assign_pointer(node->slots[offset],
-					cc_xa_mk_node(child));
-			if (cc_xa_is_value(curr))
-				values--;
-		} else {
-			unsigned int canon = offset - xas->xa_sibs;
-
-			node_set_marks(node, canon, NULL, 0, marks);
-			rcu_assign_pointer(node->slots[canon], entry);
-			while (offset > canon)
-				rcu_assign_pointer(node->slots[offset--],
-						cc_xa_mk_sibling(canon));
-			values += (cc_xa_is_value(entry) - cc_xa_is_value(curr)) *
-					(xas->xa_sibs + 1);
-		}
-	} while (offset-- > xas->xa_offset);
-
-	__sync_fetch_and_add(&node->nr_values, values);
-	cc_xas_rewind_refcnt(xas);
+	base = index & ~((1UL << order) - 1);
+	leaves = 1UL << (order - CC_XA_CHUNK_SHIFT);
+	for (i = 0; i < leaves; i++) {
+		cc_xas_set(xas, base + i * CC_XA_CHUNK_SIZE);
+		cc_xas_split_leaf(xas, entry, CC_XA_CHUNK_MASK);
+		if (cc_xas_error(xas))
+			return;
+	}
+	cc_xas_set(xas, index);
 }
 EXPORT_SYMBOL_GPL(cc_xas_split);
-
-static void __cc_xas_init_node_for_split(struct cc_xa_state *xas,
-		struct cc_xa_node *node, void *entry)
-{
-	unsigned int i;
-	void *sibling = NULL;
-	unsigned int mask = xas->xa_sibs;
-
-	node->array = xas->xa;
-	for (i = 0; i < CC_XA_CHUNK_SIZE; i++) {
-		if ((i & mask) == 0) {
-			RCU_INIT_POINTER(node->slots[i], entry);
-			sibling = cc_xa_mk_sibling(i);
-		} else {
-			RCU_INIT_POINTER(node->slots[i], sibling);
-		}
-	}
-}
 
 /**
  * cc_xas_try_split() - Try to split a multi-index entry.
  * @xas: XArray operation state.
- * @entry: New entry to store in the array, not the expected old entry.
+ * @entry: The entry to split, which is also stored in the smaller entries.
  * @order: Current entry order.
  *
- * The size of the new entries is set in @xas.  The value in @entry is
- * copied to all the replacement entries.  Use cc_xas_try_split_min_order()
- * to select a supported target order requiring at most one new node.
- * If a child is needed, use the first preallocated node or allocate one
- * with GFP_NOWAIT, adding __GFP_ACCOUNT for an accounted array.
+ * The size of the new entries is set in @xas.  Only the piece that holds the
+ * index of @xas is split, as cc_xas_try_split_min_order() steps expect.
  *
- * Errors are recorded in @xas before any shared split mutation.  When a
- * child is needed, -EINVAL is recorded if @order is not a chunk boundary
- * or xa_sibs differs from (1 << ((order - 1) % CC_XA_CHUNK_SHIFT)) - 1.
- * This is not general validation of arbitrary split orders.  Allocation
- * failure records -ENOMEM, which can be retried with cc_xas_nomem().
+ * Every slot is changed with a CAS from the value that made it part of the
+ * entry, so the split does not overwrite another writer.  -EEXIST is
+ * recorded if the canonical slot does not hold @entry: the split replaces an
+ * entry with smaller entries of the same value, and without a lock that is
+ * the only way to name the entry meant.  The caller must own the entry, as
+ * the holder of a folio lock does.  Values are never multi-index and need no
+ * split.
  *
- * -EEXIST is recorded only if final revalidation, before the first shared
- * mutation, observes that the canonical slot differs from the entry loaded
- * by this invocation.  This does not detect later changes, sibling-only
- * changes or ABA, and does not provide concurrent multi-slot atomicity.
+ * An entry of a leaf or more is one entry per leaf, so a target order of a
+ * leaf or more changes nothing.  -EINVAL is recorded for an entry larger
+ * than a leaf with a smaller target; step down with
+ * cc_xas_try_split_min_order() or use cc_xas_split().  A cc split never
+ * allocates.  Errors free an unpublished allocation chain; all exits release
+ * traversal references.
  *
- * Success preserves unused preallocation and the cursor, consuming exactly
- * one node for a vertical split.  Errors free only the unpublished allocation
- * chain and release the cursor.  All exits release traversal references.
- *
- * As with cc_xas_split(), callers must exclude concurrent writers and garbage
- * collection for the affected range; xa_lock alone does not exclude lockless
- * cc_xas_store().  This API does not provide a lockless split transaction.
- *
- * Context: Any context.  The caller should hold the xa_lock.
+ * Context: Any context.
  */
 void cc_xas_try_split(struct cc_xa_state *xas, void *entry, unsigned int order)
 {
-	unsigned int sibs = (1 << (order % CC_XA_CHUNK_SHIFT)) - 1;
-	unsigned int offset, marks;
-	struct cc_xa_node *node;
-	void *curr = cc_xas_load(xas, false);
-	int values = 0;
-	int error;
-	gfp_t gfp = GFP_NOWAIT;
-
-	node = xas->xa_node;
-	if (cc_xas_top(node)) {
+	if (xas->xa_shift >= CC_XA_CHUNK_SHIFT) {
 		cc_xas_rewind_refcnt(xas);
 		return;
 	}
-
-	if (xas->xa->xa_flags & CC_XA_FLAGS_ACCOUNT)
-		gfp |= __GFP_ACCOUNT;
-
-	marks = node_get_marks(node, xas->xa_offset);
-	offset = xas->xa_offset + sibs;
-
-	if (xas->xa_shift < node->shift) {
-		struct cc_xa_node *child = xas->xa_alloc;
-		unsigned int expected_sibs =
-			(1 << ((order - 1) % CC_XA_CHUNK_SHIFT)) - 1;
-
-		if (sibs || xas->xa_sibs != expected_sibs) {
-			error = -EINVAL;
-			goto error;
-		}
-
-		if (!child) {
-			child = kmem_cache_alloc(radix_tree_node_cachep, gfp);
-			if (!child) {
-				error = -ENOMEM;
-				goto error;
-			}
-			RCU_INIT_POINTER(child->parent, xas->xa_alloc);
-			xas->xa_alloc = child;
-		}
-		__cc_xas_init_node_for_split(xas, child, entry);
-		child->shift = node->shift - CC_XA_CHUNK_SHIFT;
-		child->offset = offset;
-		child->count = CC_XA_CHUNK_SIZE;
-		child->nr_values = cc_xa_is_value(entry) ?
-				CC_XA_CHUNK_SIZE : 0;
-		child->refcnt = 0;
-		child->gc_flag = 0;
-		child->del = 0;
-
-		if (cc_xa_entry(xas->xa, node, xas->xa_offset) != curr) {
-			error = -EEXIST;
-			goto error;
-		}
-
-		/* Retain the chain successor before installing the live parent. */
-		xas->xa_alloc = rcu_dereference_raw(child->parent);
-		RCU_INIT_POINTER(child->parent, node);
-		node_set_marks(node, offset, child, xas->xa_sibs, marks);
-		rcu_assign_pointer(node->slots[offset], cc_xa_mk_node(child));
-		if (cc_xa_is_value(curr))
-			values--;
-		cc_xas_update(xas, child);
-	} else {
-		if (cc_xa_entry(xas->xa, node, xas->xa_offset) != curr) {
-			error = -EEXIST;
-			goto error;
-		}
-
-		do {
-			unsigned int canon = offset - xas->xa_sibs;
-
-			node_set_marks(node, canon, NULL, 0, marks);
-			rcu_assign_pointer(node->slots[canon], entry);
-			while (offset > canon)
-				rcu_assign_pointer(node->slots[offset--],
-						cc_xa_mk_sibling(canon));
-			values += (cc_xa_is_value(entry) - cc_xa_is_value(curr)) *
-					(xas->xa_sibs + 1);
-		} while (offset-- > xas->xa_offset);
+	if (order > CC_XA_CHUNK_SHIFT) {
+		cc_xas_rewind_refcnt(xas);
+		cc_xas_destroy(xas);
+		cc_xas_set_err(xas, -EINVAL);
+		return;
 	}
-
-	__sync_fetch_and_add(&node->nr_values, values);
-	cc_xas_update(xas, node);
-	cc_xas_rewind_refcnt(xas);
-	return;
-
-error:
-	cc_xas_destroy(xas);
-	cc_xas_rewind_refcnt(xas);
-	cc_xas_set_err(xas, error);
+	cc_xas_split_leaf(xas, entry, order == CC_XA_CHUNK_SHIFT ?
+			  CC_XA_CHUNK_MASK : (1U << order) - 1);
 }
 EXPORT_SYMBOL_GPL(cc_xas_try_split);
 #endif

@@ -211,32 +211,33 @@ state; a return of zero does not distinguish absence from an order-0 entry.
 
 For ``cc_xas_try_split()`` and ``cc_xas_split()``, the ``order`` argument is
 the current order.  The desired target order is set in the state with
-``cc_xas_set_order()``.  Their ``entry`` argument is the replacement value,
-not an expected old entry.
+``cc_xas_set_order()``.  Their ``entry`` argument is the value of the
+replacement entries.  A split within one node also requires the canonical
+slot to hold ``entry`` and records ``-EEXIST`` otherwise: every caller
+replaces an entry with smaller entries of the same value, and without a lock
+this is the only way to name the entry that is meant.  If no leaf holds the
+index, there is nothing to split and no error is recorded.
 
 ``cc_xas_try_split_min_order(order)`` is a pure calculation.  At a chunk
 boundary it returns ``order - 1`` (or zero for order zero); otherwise it
-returns the lower chunk boundary.  It chooses a target requiring at most
-one new node, not a general arbitrary-order split.
+returns the lower chunk boundary.  It gives the next target of a split
+that goes one step at a time, not a general arbitrary-order split.
 
-``cc_xas_try_split()`` returns void; inspect ``cc_xas_error()``.  It can use
-one preallocated node or allocate with ``GFP_NOWAIT``.  Its ``-EINVAL`` check
-covers the supported child-creation geometry, not all malformed inputs.
-Its ``-EEXIST`` check revalidates the canonical slot immediately before the
-first shared mutation, against the entry loaded by that invocation.
-It does not detect later changes, sibling-only changes, or ABA.
-Success preserves unused preallocation; errors free the unpublished chain.
+``cc_xas_try_split()`` returns void; inspect ``cc_xas_error()``.  It splits
+only the piece that holds the index of the state.  A target order of a leaf
+or more changes nothing, because such an entry is already one entry per
+leaf.  ``-EINVAL`` is recorded for an entry larger than a leaf with a
+smaller target; step down with ``cc_xas_try_split_min_order()``.
+Errors free an unpublished allocation chain.
 
-``cc_xas_split_alloc()`` prepares nodes for ``cc_xas_split()`` and may sleep
-as permitted by GFP flags.  Check its state before proceeding; release
-unused allocation on every abandoned path.  Do not call ``cc_xas_split()``
-without the allocation its requested geometry needs.
+``cc_xas_split()`` splits every leaf of the entry.  ``cc_xas_split_alloc()``
+is kept for callers copied from the ordinary XArray and does nothing.
 
-Both split operations update multiple slots.  The caller must exclude
-concurrent writers and physical collection for the affected range in
-addition to meeting the documented ``xa_lock`` requirement.  ``xa_lock``
-alone cannot exclude lockless ``cc_xas_store()``.  Neither API supplies a
-concurrent split transaction or a large-folio design.
+A split changes each slot with a CAS from the value that made it part of the
+entry and skips a slot that has left the entry, so it never overwrites
+another writer.  The caller must own the entry, as the holder of a folio lock
+does.  A cc split never creates a node: entries live in leaves only, so
+``cc_xas_split_alloc()`` allocates nothing.
 
 Callers may rely on the following for order-greater-than-zero stores and
 deletes, and must not add compensation code:
@@ -285,6 +286,9 @@ Callers should also know the limits:
   order.
 * Shadow values that an order-greater-than-zero store displaced before it
   failed with ``-EEXIST`` are dropped, not restored.
+* ``-EEXIST`` from ``cc_xas_split()``, or an error from the stores that give
+  the pieces to their folios, means that the ownership rule was broken.
+  There is no undo: leaves before the failing one are already split.
 * A lookup can still return an entry for the wrong index if, between its two
   reads, the entry is deleted and an entry of the same geometry is stored
   again.  Page cache lookups must keep checking that the folio they locked
