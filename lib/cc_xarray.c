@@ -585,15 +585,23 @@ static void cc_xas_delete_node(struct cc_xa_state *xas)
 
 	for (;;) {
 		struct cc_xa_node *parent;
-		unsigned char parent_cnt;
+		unsigned char parent_cnt, count;
 
 		/* Escape if @node is root node */
 		if (!cc_xa_parent(xas->xa, node))
 			break;
 
-		CC_XA_NODE_BUG_ON(node, node->count > CC_XA_CHUNK_SIZE);
+		/*
+		 * Other writers may have changed the count since the caller
+		 * saw it reach zero, and as in update_node() their changes
+		 * need not be matched yet: a store that fills the leaf adds
+		 * CC_XA_CHUNK_SIZE on top of a change that is still on its way.
+		 */
+		count = __atomic_load_n(&node->count, __ATOMIC_SEQ_CST);
+		CC_XA_NODE_BUG_ON(node, count > 2 * CC_XA_CHUNK_SIZE &&
+					count < U8_MAX - CC_XA_CHUNK_SIZE);
 		/* Check if entry count is not zero. */
-		if (__atomic_load_n(&node->count, __ATOMIC_SEQ_CST))
+		if (count)
 			break;
 
 		/* Return if gc_flag is already set. 

@@ -37,6 +37,20 @@ static void *scheduled_cas(void *slot, void *old, void *entry)
 	return __sync_val_compare_and_swap((void **)slot, old, entry);
 }
 
+/* Run the count intruder once the watched counter has been brought to zero. */
+static void (*count_intruder)(void);
+static void *count_watched;
+
+#define __sync_add_and_fetch(p, v) ({ \
+	__typeof__(*(p)) __new = __atomic_add_fetch(p, v, __ATOMIC_SEQ_CST); \
+	if (count_intruder && (void *)(p) == count_watched && !__new) { \
+		void (*__run)(void) = count_intruder; \
+		count_intruder = NULL; \
+		__run(); \
+	} \
+	__new; \
+})
+
 #undef rcu_assign_pointer
 #define rcu_assign_pointer(p, v) do { \
 	scheduled_write(&(p)); \
@@ -46,6 +60,8 @@ static void *scheduled_cas(void *slot, void *old, void *entry)
 	scheduled_cas(slot, old, entry)
 #include "../../../lib/cc_xarray.c"
 #undef __sync_val_compare_and_swap
+#undef __sync_add_and_fetch
+
 #define BASE	4UL	/* order-2 entry covers BASE..BASE + 3 */
 #define ORDER	2U
 #define NR	(1UL << ORDER)
@@ -1178,6 +1194,46 @@ static void far_conflict(void)
 static int small[NR];
 
 /*
+ * A store and the update of the node count are separate steps.  An erase of
+ * another writer has emptied its slot and not yet taken it off the count when
+ * an entry of a whole leaf is stored.
+ */
+static void fill_leaf(void)
+{
+	struct cc_xa_node *node = leaf_of(FAR);
+
+	EXPECT(!insert(FAR + 63, 0, &other));
+	node->slots[63] = NULL;
+	EXPECT(!insert(FAR, CC_XA_CHUNK_SHIFT, &big));
+}
+
+/*
+ * The count of a leaf between the erase that brought it to zero and the
+ * attempt to delete the leaf: one more than the leaf has slots.
+ */
+static void far_count(void)
+{
+	struct cc_xa_node *node;
+
+	begin("far-count");
+	EXPECT(!insert(FAR + 5, 0, &small[0]));
+	node = leaf_of(FAR);
+	count_watched = &node->count;
+	count_intruder = fill_leaf;
+	EXPECT(!erase(FAR + 5, 0));
+	EXPECT(!count_intruder);
+	EXPECT(node->count == CC_XA_CHUNK_SIZE + 1);
+	/* The change that was on its way arrives. */
+	__sync_fetch_and_sub(&node->count, 1);
+	EXPECT(!node->del);
+	EXPECT(holds(FAR, CC_XA_CHUNK_SIZE, &big) == CC_XA_CHUNK_SIZE);
+	far_counted(CC_XA_CHUNK_SIZE);
+	EXPECT(!erase(FAR, CC_XA_CHUNK_SHIFT));
+	EXPECT(holds(FAR, CC_XA_CHUNK_SIZE, NULL) == CC_XA_CHUNK_SIZE);
+	end();
+}
+
+/*
  * cc_xas_store() of NULL clears the range of the state whatever it holds, as
  * xas_store() does.  cc_xas_store_expected() names one entry and removes that
  * entry alone.  The state keeps its range for the next operation.
@@ -1765,6 +1821,7 @@ int main(int argc, char **argv)
 		{ "far-delete-meets-insert", far_delete_meets_insert },
 		{ "far-nomem", far_nomem },
 		{ "far-conflict", far_conflict },
+		{ "far-count", far_count },
 		{ "delete-range", delete_range },
 	};
 	unsigned int i, failed = 0;
