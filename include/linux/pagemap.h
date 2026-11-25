@@ -387,6 +387,21 @@ static inline void mapping_set_gfp_mask(struct address_space *m, gfp_t mask)
 #define MAX_PAGECACHE_ORDER	min(MAX_XAS_ORDER, PREFERRED_MAX_PAGECACHE_ORDER)
 
 /*
+ * A mapping whose i_pages is a ccXArray keeps its folios below PMD size.
+ * khugepaged and the PMD mapping paths change the tree with ordinary XArray
+ * operations; mapping_pmd_folio_support() is false below PMD order and keeps
+ * them away.  The limit applies whenever the order is read, so it does not
+ * matter whether the filesystem sets its order range before or after the
+ * tree becomes a ccXArray.
+ */
+#define MAX_CC_PAGECACHE_ORDER	min(MAX_PAGECACHE_ORDER, PMD_ORDER - 1)
+
+static inline bool mapping_is_cc(const struct address_space *mapping)
+{
+	return cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages));
+}
+
+/*
  * mapping_max_folio_size_supported() - Check the max folio size supported
  *
  * The filesystem should call this function at mount time if there is a
@@ -411,6 +426,10 @@ static inline size_t mapping_max_folio_size_supported(void)
  * if the filesystem needs special handling of folio sizes (ie there is
  * something the core cannot know).
  * Do not tune it based on, eg, i_size.
+ *
+ * A ccXArray mapping never gets folios above MAX_CC_PAGECACHE_ORDER, whatever
+ * @max says; see mapping_max_folio_order().  A @min above that order is not
+ * supported for such a mapping.
  *
  * Context: This should not be called while the inode is active as it
  * is non-atomic.
@@ -460,9 +479,14 @@ static inline void mapping_set_large_folios(struct address_space *mapping)
 static inline unsigned int
 mapping_max_folio_order(const struct address_space *mapping)
 {
+	unsigned int order;
+
 	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
 		return 0;
-	return (mapping->flags & AS_FOLIO_ORDER_MAX_MASK) >> AS_FOLIO_ORDER_MAX;
+	order = (mapping->flags & AS_FOLIO_ORDER_MAX_MASK) >> AS_FOLIO_ORDER_MAX;
+	if (order > MAX_CC_PAGECACHE_ORDER && mapping_is_cc(mapping))
+		order = MAX_CC_PAGECACHE_ORDER;
+	return order;
 }
 
 static inline unsigned int

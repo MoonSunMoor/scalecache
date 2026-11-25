@@ -2,7 +2,7 @@
 
 .PHONY: clean
 
-TARGETS = main idr-test multiorder xarray maple cc-shadow-reclaim
+TARGETS = main idr-test multiorder xarray maple cc-shadow-reclaim cc-multi-order
 CORE_OFILES = $(SHARED_OFILES) xarray.o maple.o test.o
 OFILES = main.o $(CORE_OFILES) regression1.o regression2.o \
 	 regression3.o regression4.o tag_check.o multiorder.o idr-test.o \
@@ -27,6 +27,11 @@ cc-shadow-reclaim.o: $(SHARED_DEPS) ../../../lib/cc_xarray.c \
 	generated/cc-shadow-workingset.h generated/cc-shadow-truncate.h \
 	generated/cc-shadow-swap.h generated/cc-shadow-mapping.h \
 	../../../include/linux/folio_batch.h
+
+cc-multi-order: cc-multi-order.o $(SHARED_OFILES)
+cc-multi-order.o: $(SHARED_DEPS) ../../../lib/cc_xarray.c \
+	../../../include/linux/cc_xarray.h ../shared/linux/cc_xarray.h \
+	../shared/linux/irqflags.h
 
 WORKINGSET_SOURCE ?= ../../../mm/workingset.c
 TRUNCATE_SOURCE ?= ../../../mm/truncate.c

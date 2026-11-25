@@ -11,14 +11,22 @@ port from Linux 6.6.8 to 7.2.8.  It complements
 The implementation is in ``include/linux/cc_xarray.h`` and
 ``lib/cc_xarray.c``.
 
-This first-stage port targets order-0 page-cache operation.  Keep large
-folios disabled for CC mappings through the page-cache allocation policy,
+The page-cache callers of this port are converted for order-0 operation
+first.  The tree stores, deletes, walks and splits entries of any order as
+"Order and split interfaces" states, but a CC mapping may only get large
+folios once every caller of that mapping follows that section.  Until then
+keep them off by leaving the maximum folio order of the mapping at zero,
 not by disabling ``CONFIG_TRANSPARENT_HUGEPAGE`` or ``CONFIG_XARRAY_MULTI``.
-Do not use DAX on CC mappings either: DAX stores multi-order entries with
-ordinary XArray operations.  Both stay disabled until the multi-index
-requirements in "Order and split interfaces" are met.
-The presence of split APIs is not a guarantee of concurrent large-folio
-support.  Direct flush (dflush) is separate from these tree interfaces.
+A filesystem turns large folios on for its CC mappings by setting a maximum
+order above zero.  It needs no limit of its own:
+``mapping_max_folio_order()`` limits a CC mapping to
+``MAX_CC_PAGECACHE_ORDER``, one below PMD order, whatever range the
+filesystem sets.  khugepaged and PMD mappings use ordinary XArray operations
+and ``mapping_pmd_folio_support()`` keeps them away below PMD order.  A
+minimum order above that limit is not supported.
+Do not use DAX on CC mappings: DAX stores multi-order entries with ordinary
+XArray operations.  Direct flush (dflush) is separate from these tree
+interfaces.
 
 Design constraints from the paper
 =================================
@@ -211,49 +219,144 @@ state; a return of zero does not distinguish absence from an order-0 entry.
 
 For ``cc_xas_try_split()`` and ``cc_xas_split()``, the ``order`` argument is
 the current order.  The desired target order is set in the state with
-``cc_xas_set_order()``.  Their ``entry`` argument is the replacement value,
-not an expected old entry.
+``cc_xas_set_order()``.  Their ``entry`` argument is the value of the
+replacement entries.  A split within one node also requires the canonical
+slot to hold ``entry`` and records ``-EEXIST`` otherwise: every caller
+replaces an entry with smaller entries of the same value, and without a lock
+this is the only way to name the entry that is meant.  If no leaf holds the
+index, there is nothing to split and no error is recorded.
 
 ``cc_xas_try_split_min_order(order)`` is a pure calculation.  At a chunk
 boundary it returns ``order - 1`` (or zero for order zero); otherwise it
-returns the lower chunk boundary.  It chooses a target requiring at most
-one new node, not a general arbitrary-order split.
+returns the lower chunk boundary.  It gives the next target of a split
+that goes one step at a time, not a general arbitrary-order split.
 
-``cc_xas_try_split()`` returns void; inspect ``cc_xas_error()``.  It can use
-one preallocated node or allocate with ``GFP_NOWAIT``.  Its ``-EINVAL`` check
-covers the supported child-creation geometry, not all malformed inputs.
-Its ``-EEXIST`` check revalidates the canonical slot immediately before the
-first shared mutation, against the entry loaded by that invocation.
-It does not detect later changes, sibling-only changes, or ABA.
-Success preserves unused preallocation; errors free the unpublished chain.
+``cc_xas_try_split()`` returns void; inspect ``cc_xas_error()``.  It splits
+only the piece that holds the index of the state.  A target order of a leaf
+or more changes nothing, because such an entry is already one entry per
+leaf.  ``-EINVAL`` is recorded for an entry larger than a leaf with a
+smaller target; step down with ``cc_xas_try_split_min_order()``.
+Errors free an unpublished allocation chain.
 
-``cc_xas_split_alloc()`` prepares nodes for ``cc_xas_split()`` and may sleep
-as permitted by GFP flags.  Check its state before proceeding; release
-unused allocation on every abandoned path.  Do not call ``cc_xas_split()``
-without the allocation its requested geometry needs.
+``cc_xas_split()`` splits every leaf of the entry.  ``cc_xas_split_alloc()``
+is kept for callers copied from the ordinary XArray and does nothing.
 
-Both split operations update multiple slots.  The caller must exclude
-concurrent writers and physical collection for the affected range in
-addition to meeting the documented ``xa_lock`` requirement.  ``xa_lock``
-alone cannot exclude lockless ``cc_xas_store()``.  Neither API supplies a
-concurrent split transaction or a large-folio design.
+A split changes each slot with a CAS from the value that made it part of the
+entry and skips a slot that has left the entry, so it never overwrites
+another writer.  The caller must own the entry, as the holder of a folio lock
+does.  A cc split never creates a node: entries live in leaves only, so
+``cc_xas_split_alloc()`` allocates nothing.
 
 Callers may rely on the following for order-greater-than-zero stores and
 deletes, and must not add compensation code:
 
 * A failed store or delete leaves no entry partially stored.  Nodes created
-  on the way may remain, as with the ordinary XArray.
-* A successful store or delete covers the whole range.
+  on the way may remain, as with the ordinary XArray.  This holds for a value
+  stored over a range too: the slots that still hold it are emptied again.
+* A store records ``-ENOMEM`` only before it has changed a slot, as upstream
+  does.  The leaves of an entry of several leaves are created before the
+  first slot is written, so the retry after ``cc_xas_nomem()`` finds the
+  range as the caller saw it.
+* ``cc_xas_find_conflict()`` and ``cc_xas_for_each_conflict()`` look at every
+  leaf of a range of several leaves, whether the first leaf exists, is
+  logically deleted or holds entries.
+* A successful store or delete covers the whole range.  ``cc_xas_store()``
+  of ``NULL`` clears every slot of the range of the state, whatever it holds,
+  and the rest of an entry that begins in the range, as ``xas_store()`` does.
+  ``cc_xas_store_expected()`` of ``NULL`` names one entry and removes that
+  entry alone.
 * Other writers do not act on an intermediate state, for example by storing
   into the wrong slot.
 
 Upstream ``xas_store()`` fails only before it changes any slot, so the
-7.2.8 originals have no compensation code.  The first-stage implementation
-does not provide these guarantees: ``cc_xas_store()`` updates the slots one
-CAS at a time and can stop part way.  The path is not executed while large
-folios and DAX stay disabled for CC mappings.  Meeting these requirements is
-a precondition for enabling either.  If they cannot be met, both stay
-disabled and this contract does not change.
+7.2.8 originals have no compensation code.  ``cc_xas_store()`` changes the
+slots one CAS at a time and provides the guarantees as follows.
+
+* A store writes the canonical slot first and the sibling slots after it.
+  If a slot cannot be taken, it releases the slots in reverse order.  A
+  delete clears the sibling slots last to first and the canonical slot at
+  the end.  A sibling therefore never refers to a slot that does not hold
+  its entry.
+* A lookup that follows a sibling checks that the sibling is still there
+  after it has read the canonical slot.
+* ``cc_xas_store_expected()`` records ``-EEXIST`` when its index lies inside
+  another entry or when the canonical slot holds a larger entry.
+* A multi-index pointer entry is deleted, replaced or split only by its
+  owner, as the holder of a folio lock is.  The owner may replace it with
+  ``cc_xas_store()`` through a state of any order at any index of the entry,
+  as ``folio_migrate_mapping()`` does with an order-0 state: the new entry
+  takes every slot and every leaf of the old one and keeps its marks.
+  A value has no owner, so it is
+  never stored as a multi-index entry.  Storing a value over a range stores
+  it in every slot, and ``cc_xas_get_order()`` of a value is zero.
+
+Callers should also know the limits:
+
+* While a store or delete is in progress, a lookup may find the entry at
+  only part of its range, and ``cc_xas_get_order()`` may return a smaller
+  order.
+* Shadow values that an order-greater-than-zero store displaced before it
+  failed with ``-EEXIST`` are dropped, not restored.
+* ``-EEXIST`` from ``cc_xas_split()``, or an error from the stores that give
+  the pieces to their folios, means that the ownership rule was broken.
+  There is no undo: leaves before the failing one are already split.
+* ``mm/huge_memory.c`` splits and stores with ``i_pages.xa_lock`` held and
+  interrupts off, which is what the node-update callback asserts.  Code it
+  calls for a CC mapping, such as the removal of after-split folios beyond
+  EOF, must use CC operations, must not take that lock again, and finds the
+  frozen old folio in the slots, not the folio it removes.
+* A lookup can still return an entry for the wrong index if, between its two
+  reads, the entry is deleted and an entry of the same geometry is stored
+  again.  Page cache lookups must keep checking that the folio they locked
+  contains the index.
+* An entry of a leaf or more (order 6 and up with 64-slot nodes) is not
+  stored in a slot of an inner node, because a cc node stays linked to its
+  parent after it is deleted.  It fills every leaf of its range instead, with
+  a canonical slot of its own in each leaf.  A store fills the leaves first
+  to last and empties them again if one cannot be taken; a delete follows the
+  same pointer from leaf to leaf.  After a successful store or delete the
+  state keeps its index and order, as with ``xas_store()``, and its cursor is
+  at the first index of the range.
+* Callers see such an entry as one entry all the same.  ``cc_xas_find()``,
+  ``cc_xas_find_marked()``, the iterators built on them, ``cc_xa_find_after()``
+  and ``cc_xas_pause()`` return it once and continue after its last leaf.
+  ``cc_xas_get_order()`` counts the leaves that hold the pointer and returns
+  the order of the whole entry.  ``cc_xas_advance()`` may be given an index in
+  another leaf.  These look at the neighbouring leaves with walks of their
+  own, so they cost more for such an entry than for a smaller one.
+* The marks of such an entry are kept in every leaf, so that a marked search
+  that starts inside the entry finds it and the pieces of a split inherit
+  them.  ``cc_xas_set_mark()`` and ``cc_xas_clear_mark()`` change all the
+  leaves when the state is at the canonical slot of one of them.  The caller
+  must serialise mark updates of one entry, as the page cache does.
+* A reader that does not own the entry may see part of it while it is stored
+  or deleted, and then gets a smaller order or the entry more than once.
+
+Where the order interfaces differ from the ordinary XArray
+---------------------------------------------------------
+
+The order interfaces are meant to behave as their ``xas_`` namesakes do;
+how the tree stores an entry is not part of that.  They differ in three
+places, each for a stated reason.
+
+* A value is one entry per index.  After a value is stored over a range,
+  ``cc_xas_get_order()`` of it is zero and a walk returns it once per index,
+  where the ordinary XArray has one entry of that order.  A multi-index entry
+  can only be taken apart without a lock by a single owner, and a shadow has
+  none: refault, reclaim and truncation all change it.  Giving it one would
+  need a gate on its canonical slot.  The result is the state the ordinary
+  XArray reaches once a large shadow has been split to order zero, which the
+  7.2.8 callers already handle.
+* A store of an order above zero can fail with ``-EEXIST`` after it has
+  displaced shadows, and those shadows are not put back.  ``xas_store()``
+  cannot fail there, because its caller holds the lock from the conflict scan
+  to the store.  Putting them back would need every order-0 insert to check
+  whether its leaf is being taken.  The only values in a CC mapping are
+  shadows, which reclaim may drop at any time; DAX and shmem, whose values
+  must not be lost, do not use CC mappings.
+* ``mapping_max_folio_order()`` stops a CC mapping one order below PMD size,
+  because khugepaged and the PMD mapping paths change ``i_pages`` with
+  ordinary XArray operations.
 
 Shadow cleanup
 ==============

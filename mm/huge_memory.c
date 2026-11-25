@@ -3721,6 +3721,43 @@ static void __split_folio_to_order(struct folio *folio, int old_order,
 		ClearPageCompound(&folio->page);
 }
 
+/*
+ * The i_pages of a ccXArray mapping is changed with cc operations.  The
+ * caller owns @folio: it holds the folio lock and has frozen the refcount,
+ * which is what a cc split and a cc store of a multi-index entry require.
+ * A cc split allocates nothing, so there is no preallocation to consume.
+ */
+static int cc_split_folio_entry(struct address_space *mapping,
+		struct folio *old_folio, pgoff_t index, int old_order,
+		int split_order, bool uniform)
+{
+	CC_XA_STATE_ORDER(xas, CC_XARRAY(&mapping->i_pages), index,
+			  split_order);
+	int err;
+
+	cc_mapping_set_update(&xas, mapping);
+	if (uniform)
+		cc_xas_split(&xas, old_folio, old_order);
+	else
+		cc_xas_try_split(&xas, old_folio, old_order);
+	err = cc_xas_error(&xas);
+	cc_xas_clear_xa_node(&xas);
+	return err;
+}
+
+/* Give the slots of an after-split folio to that folio. */
+static void cc_store_split_folio(struct address_space *mapping,
+		struct folio *new_folio)
+{
+	CC_XA_STATE_ORDER(xas, CC_XARRAY(&mapping->i_pages), new_folio->index,
+			  folio_order(new_folio));
+
+	cc_mapping_set_update(&xas, mapping);
+	cc_xas_store(&xas, new_folio);
+	VM_WARN_ON_ONCE_FOLIO(cc_xas_error(&xas), new_folio);
+	cc_xas_clear_xa_node(&xas);
+}
+
 /**
  * __split_unmapped_folio() - splits an unmapped @folio to lower order folios in
  * two ways: uniform split or non-uniform split.
@@ -3795,7 +3832,15 @@ static int __split_unmapped_folio(struct folio *folio, int new_order,
 			 * with after-split folios and the original one is
 			 * unfrozen.
 			 */
-			if (split_type == SPLIT_TYPE_UNIFORM) {
+			if (mapping_is_cc(mapping)) {
+				int err = cc_split_folio_entry(mapping,
+						old_folio, folio->index,
+						old_order, split_order,
+						split_type == SPLIT_TYPE_UNIFORM);
+
+				if (err)
+					return err;
+			} else if (split_type == SPLIT_TYPE_UNIFORM) {
 				xas_split(xas, old_folio, old_order);
 			} else {
 				xas_set_order(xas, folio->index, split_order);
@@ -4003,8 +4048,13 @@ static int __folio_freeze_and_split_unmapped(struct folio *folio, unsigned int n
 
 			/* Add the new folio to the page cache. */
 			if (new_folio->index < end) {
-				__xa_store(&mapping->i_pages, new_folio->index,
-					   new_folio, 0);
+				if (mapping_is_cc(mapping))
+					cc_store_split_folio(mapping,
+							     new_folio);
+				else
+					__xa_store(&mapping->i_pages,
+						   new_folio->index,
+						   new_folio, 0);
 				continue;
 			}
 
@@ -4145,7 +4195,7 @@ static int __folio_split(struct folio *folio, unsigned int new_order,
 
 		mapping_set_update(&xas, mapping);
 
-		if (split_type == SPLIT_TYPE_UNIFORM) {
+		if (split_type == SPLIT_TYPE_UNIFORM && !mapping_is_cc(mapping)) {
 			xas_set_order(&xas, folio->index, new_order);
 			xas_split_alloc(&xas, folio, old_order, gfp);
 			if (xas_error(&xas)) {
@@ -4189,7 +4239,10 @@ static int __folio_split(struct folio *folio, unsigned int new_order,
 		 */
 		xas_lock(&xas);
 		xas_reset(&xas);
-		if (xas_load(&xas) != folio) {
+		if (mapping_is_cc(mapping) ?
+		    cc_xa_load(CC_XARRAY(&mapping->i_pages),
+			       folio->index) != folio :
+		    xas_load(&xas) != folio) {
 			ret = -EAGAIN;
 			goto fail;
 		}
