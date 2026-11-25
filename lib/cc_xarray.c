@@ -333,6 +333,17 @@ static void cc_xa_leaf_run(struct cc_xarray *xa, unsigned long index,
 		*last += CC_XA_CHUNK_SIZE;
 }
 
+/* cc_xas_advance() to an index outside the node of the cursor. */
+void cc_xas_advance_far(struct cc_xa_state *xas, unsigned long index)
+{
+	cc_xas_set(xas, index);
+	cc_xas_load(xas, true);
+	/* cc_xas_advance() leaves the slot of the index, not its canonical. */
+	if (cc_xas_is_node(xas))
+		cc_xas_set_offset(xas);
+}
+EXPORT_SYMBOL_GPL(cc_xas_advance_far);
+
 #define CC_XA_RCU_FREE	((struct cc_xarray *)1)
 
 static void cc_xa_node_free(struct cc_xa_node *node)
@@ -2214,10 +2225,12 @@ EXPORT_SYMBOL_GPL(cc_xas_try_split);
 void cc_xas_pause(struct cc_xa_state *xas)
 {
 	struct cc_xa_node *node = xas->xa_node;
+	void *leaf;
 
 	if (cc_xas_invalid(xas))
 		return;
 
+	leaf = cc_xa_leaf_entry(xas->xa, node);
 	//xas->xa_node = CC_XAS_RESTART;
 	cc_xas_set_xa_node(xas, CC_XAS_RESTART);
 	if (node) {
@@ -2226,8 +2239,14 @@ void cc_xas_pause(struct cc_xa_state *xas)
 			if (!cc_xa_is_sibling(cc_xa_entry(xas->xa, node, offset)))
 				break;
 		}
+		/* The walk may have started at an index inside the entry. */
 		xas->xa_index &= ~0UL << node->shift;
-		xas->xa_index += (offset - xas->xa_offset) << node->shift;
+		xas->xa_index &= ~((unsigned long)CC_XA_CHUNK_MASK << node->shift);
+		xas->xa_index += offset << node->shift;
+		/* Resume after the last leaf of an entry of several leaves. */
+		while (leaf && xas->xa_index &&
+		       cc_xa_leaf_entry_at(xas->xa, xas->xa_index) == leaf)
+			xas->xa_index += CC_XA_CHUNK_SIZE;
 		if (xas->xa_index == 0)
 			//xas->xa_node = CC_XAS_BOUNDS;
 			cc_xas_set_xa_node(xas, CC_XAS_BOUNDS);
@@ -2337,7 +2356,8 @@ EXPORT_SYMBOL_GPL(__cc_xas_next);
  */
 void *cc_xas_find(struct cc_xa_state *xas, unsigned long max)
 {
-	void *entry;
+	void *entry, *skip = NULL;
+	unsigned long next = 0;
 
 	if (cc_xas_error(xas) || xas->xa_node == CC_XAS_BOUNDS)
 		return NULL;
@@ -2353,9 +2373,16 @@ void *cc_xas_find(struct cc_xa_state *xas, unsigned long max)
 			cc_xas_rewind_refcnt(xas);
 			return entry;
 		}
-	} else if (!xas->xa_node->shift &&
-		    xas->xa_offset != (xas->xa_index & CC_XA_CHUNK_MASK)) {
-		xas->xa_offset = ((xas->xa_index - 1) & CC_XA_CHUNK_MASK) + 1;
+	} else if (!xas->xa_node->shift) {
+		/*
+		 * An entry of several leaves has a canonical slot in each of
+		 * them; the walk returns it once.
+		 */
+		skip = cc_xa_leaf_entry(xas->xa, xas->xa_node);
+		next = (xas->xa_index | CC_XA_CHUNK_MASK) + 1;
+		if (xas->xa_offset != (xas->xa_index & CC_XA_CHUNK_MASK))
+			xas->xa_offset = ((xas->xa_index - 1) &
+					  CC_XA_CHUNK_MASK) + 1;
 	}
 
 	__cc_xas_advance(xas);
@@ -2376,8 +2403,14 @@ void *cc_xas_find(struct cc_xa_state *xas, unsigned long max)
 			continue;
 		}
 		if (entry && !cc_xa_is_sibling(entry)) {
-			cc_xas_rewind_refcnt(xas);
-			return entry;
+			if (entry != skip || xas->xa_index != next ||
+			    cc_xa_leaf_entry(xas->xa, xas->xa_node) != entry) {
+				cc_xas_rewind_refcnt(xas);
+				return entry;
+			}
+			/* The next leaf of the entry just returned. */
+			next += CC_XA_CHUNK_SIZE;
+			xas->xa_offset = CC_XA_CHUNK_MASK;
 		}
 
 		__cc_xas_advance(xas);
@@ -2416,7 +2449,8 @@ void *cc_xas_find_marked(struct cc_xa_state *xas, unsigned long max, cc_xa_mark_
 {
 	bool advance = true;
 	unsigned int offset;
-	void *entry;
+	void *entry, *skip = NULL;
+	unsigned long next = 0;
 	struct cc_xa_node *node;
 
 	if (cc_xas_error(xas))
@@ -2427,7 +2461,12 @@ void *cc_xas_find_marked(struct cc_xa_state *xas, unsigned long max, cc_xa_mark_
 	if (!xas->xa_node) {
 		xas->xa_index = 1;
 		goto out;
-	} else if (cc_xas_top(xas->xa_node)) {
+	} else if (!cc_xas_top(xas->xa_node)) {
+		/* As in cc_xas_find(): an entry of several leaves, once. */
+		skip = cc_xa_leaf_entry(xas->xa, xas->xa_node);
+		next = xas->xa_offset == CC_XA_CHUNK_SIZE ? xas->xa_index :
+				(xas->xa_index | CC_XA_CHUNK_MASK) + 1;
+	} else {
 		advance = false;
 		entry = cc_xa_head(xas->xa);
 		//xas->xa_node = NULL;
@@ -2483,8 +2522,14 @@ void *cc_xas_find_marked(struct cc_xa_state *xas, unsigned long max, cc_xa_mark_
 			continue;
 		if (cc_xa_is_sibling(entry))
 			continue;
-		if (!cc_xa_is_node(entry))
-			return entry;
+		if (!cc_xa_is_node(entry)) {
+			if (entry != skip || xas->xa_index != next ||
+			    cc_xa_leaf_entry(xas->xa, xas->xa_node) != entry)
+				return entry;
+			next += CC_XA_CHUNK_SIZE;
+			advance = true;
+			continue;
+		}
 		//xas->xa_node = cc_xa_to_node(entry);
 		cc_xas_set_xa_node(xas, cc_xa_to_node(entry));
 		cc_xas_set_offset(xas);
@@ -3016,32 +3061,58 @@ unlock:
  * must keep @xas valid and free of errors, with xa_offset at the canonical
  * entry rather than a sibling slot.
  *
- * This function only reads the existing cursor and node slots.  It does not
- * reload the entry, change the cursor, or acquire or release node references.
+ * This function does not reload the entry or change the cursor.  For an
+ * entry of a leaf or more it also looks at the neighbouring leaves, with
+ * walks of its own.
  *
  * Return: The order of the entry, or 0 for an entry stored in the root.
  */
-int cc_xas_get_order(struct cc_xa_state *xas)
+static int cc_node_order(struct cc_xarray *xa, struct cc_xa_node *node,
+			 unsigned int offset, unsigned long index)
 {
+	unsigned long first, last, leaves;
 	int order = 0;
+	void *entry;
 
-	if (!xas->xa_node)
-		return 0;
-
-	CC_XA_NODE_BUG_ON(xas->xa_node, cc_xa_is_sibling(cc_xa_entry(xas->xa,
-		       xas->xa_node, xas->xa_offset)));
+	/*
+	 * A reader without the entry's owner lock may find that a larger
+	 * entry has taken the slot since it was loaded.
+	 */
+	entry = cc_xa_entry(xa, node, offset);
+	if (cc_xa_is_sibling(entry))
+		offset = cc_xa_to_sibling(entry);
 	for (;;) {
-		unsigned int slot = xas->xa_offset + (1 << order);
+		unsigned int slot = offset + (1 << order);
 
 		if (slot >= CC_XA_CHUNK_SIZE)
 			break;
-		if (!cc_xa_is_sibling(cc_xa_entry(xas->xa, xas->xa_node, slot)))
+		if (!cc_xa_is_sibling(cc_xa_entry(xa, node, slot)))
 			break;
 		order++;
 	}
 
-	order += xas->xa_node->shift;
+	order += node->shift;
+	if (order != CC_XA_CHUNK_SHIFT)
+		return order;
+
+	/* An entry of several leaves: count the leaves it fills. */
+	entry = cc_xa_leaf_entry(xa, node);
+	if (!entry)
+		return order;
+	cc_xa_leaf_run(xa, index, entry, &first, &last);
+	for (leaves = ((last - first) >> CC_XA_CHUNK_SHIFT) + 1; leaves > 1;
+	     leaves >>= 1)
+		order++;
 	return order;
+}
+
+int cc_xas_get_order(struct cc_xa_state *xas)
+{
+	if (!xas->xa_node)
+		return 0;
+
+	return cc_node_order(xas->xa, xas->xa_node, xas->xa_offset,
+			     xas->xa_index);
 }
 EXPORT_SYMBOL_GPL(cc_xas_get_order);
 
@@ -3067,19 +3138,7 @@ int cc_xa_get_order(struct cc_xarray *xa, unsigned long index)
 	if (!xas.xa_node)
 		goto unlock;
 
-	CC_XA_NODE_BUG_ON(xas.xa_node, cc_xa_is_sibling(cc_xa_entry(xa,
-			 xas.xa_node, xas.xa_offset)));
-	for (;;) {
-		unsigned int slot = xas.xa_offset + (1 << order);
-
-		if (slot >= CC_XA_CHUNK_SIZE)
-			break;
-		if (!cc_xa_is_sibling(cc_xa_entry(xa, xas.xa_node, slot)))
-			break;
-		order++;
-	}
-
-	order += xas.xa_node->shift;
+	order = cc_node_order(xa, xas.xa_node, xas.xa_offset, index);
 unlock:
 	rcu_read_unlock();
 
@@ -3369,12 +3428,15 @@ void *cc_xa_find_after(struct cc_xarray *xa, unsigned long *indexp,
 			unsigned long max, cc_xa_mark_t filter)
 {
 	CC_XA_STATE(xas, xa, *indexp + 1);
-	void *entry;
+	void *entry, *inside = NULL;
 
 	if (xas.xa_index == 0)
 		return NULL;
 
 	rcu_read_lock();
+	/* An entry of several leaves that holds @indexp goes on in the next. */
+	if (!(xas.xa_index & CC_XA_CHUNK_MASK))
+		inside = cc_xa_leaf_entry_at(xa, *indexp);
 	for (;;) {
 		if ((__force unsigned int)filter < CC_XA_MAX_MARKS)
 			entry = cc_xas_find_marked(&xas, max, filter);
@@ -3384,6 +3446,11 @@ void *cc_xa_find_after(struct cc_xarray *xa, unsigned long *indexp,
 		if (cc_xas_invalid(&xas))
 			break;
 		if (cc_xas_sibling(&xas))
+			continue;
+		/* The entry that holds @indexp, found again at its start. */
+		if (entry && xas.xa_index <= *indexp)
+			continue;
+		if (entry && entry == inside && xas.xa_index == *indexp + 1)
 			continue;
 		if (!cc_xas_retry(&xas, entry))
 			break;

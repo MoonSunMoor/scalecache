@@ -301,6 +301,13 @@ Callers should also know the limits:
   same pointer from leaf to leaf.  After a successful store or delete the
   state keeps its index and order, as with ``xas_store()``, and its cursor is
   at the first index of the range.
+* Callers see such an entry as one entry all the same.  ``cc_xas_find()``,
+  ``cc_xas_find_marked()``, the iterators built on them, ``cc_xa_find_after()``
+  and ``cc_xas_pause()`` return it once and continue after its last leaf.
+  ``cc_xas_get_order()`` counts the leaves that hold the pointer and returns
+  the order of the whole entry.  ``cc_xas_advance()`` may be given an index in
+  another leaf.  These look at the neighbouring leaves with walks of their
+  own, so they cost more for such an entry than for a smaller one.
 * The marks of such an entry are kept in every leaf, so that a marked search
   that starts inside the entry finds it and the pieces of a split inherit
   them.  ``cc_xas_set_mark()`` and ``cc_xas_clear_mark()`` change all the

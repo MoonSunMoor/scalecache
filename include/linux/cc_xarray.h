@@ -1713,9 +1713,21 @@ static inline void cc_xas_set(struct cc_xa_state *xas, unsigned long index)
 	cc_xas_set_xa_node(xas, CC_XAS_RESTART);
 }
 
+void cc_xas_advance_far(struct cc_xa_state *xas, unsigned long index);
+
 static inline void cc_xas_advance(struct cc_xa_state *xas, unsigned long index)
 {
 	unsigned char shift = cc_xas_is_node(xas) ? xas->xa_node->shift : 0;
+
+	/*
+	 * An entry of several leaves ends in another leaf than the cursor's,
+	 * so the index may lie outside this node.
+	 */
+	if (cc_xas_is_node(xas) &&
+	    ((index ^ xas->xa_index) >> shift) > CC_XA_CHUNK_MASK) {
+		cc_xas_advance_far(xas, index);
+		return;
+	}
 
 	xas->xa_index = index;
 	xas->xa_offset = (index >> shift) & CC_XA_CHUNK_MASK;

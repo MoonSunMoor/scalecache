@@ -759,8 +759,10 @@ static void far_alone(void)
 		mark(FAR, true);
 		EXPECT(!store_order(FAR, 0, &other));
 		EXPECT(holds(FAR, nr, &other) == nr);
+		EXPECT(cc_xa_get_order(XA, FAR) == order);
 		EXPECT(!store_order(FAR + nr - 1, 0, &big));
 		EXPECT(holds(FAR, nr, &big) == nr);
+		EXPECT(cc_xa_get_order(XA, FAR + nr - 1) == order);
 		EXPECT(marked(FAR) && marked(FAR + nr - 1));
 		EXPECT(!cc_xa_load(XA, FAR - 1) && !cc_xa_load(XA, FAR + nr));
 		far_counted(nr);
@@ -815,6 +817,9 @@ static void far_split(void)
 	}
 	EXPECT(holds(FAR, 256, &big) == 256);
 	EXPECT(cc_xa_get_order(XA, FAR + 70) == 0);
+	/* The other leaves were not touched: orders 6 and 7 remain. */
+	EXPECT(cc_xa_get_order(XA, FAR) == CC_XA_CHUNK_SHIFT);
+	EXPECT(cc_xa_get_order(XA, FAR + 200) == CC_XA_CHUNK_SHIFT + 1);
 	far_counted(256);
 	/* Each index of the split leaf can now go on its own. */
 	EXPECT(!erase(FAR + 70, 0));
@@ -857,6 +862,32 @@ static void far_split(void)
 	end();
 }
 
+#define WALK_ORDER	8U
+#define WALK_NR		(1UL << WALK_ORDER)
+
+static int before, after, piece[3];
+
+/* What a walk over present entries returns from @start on. */
+static unsigned int walk(unsigned long start, void **seen,
+			 unsigned long *at, int *order, bool pausing)
+{
+	CC_XA_STATE(xas, XA, start);
+	unsigned int n = 0;
+	void *entry;
+
+	cc_xas_for_each(&xas, entry, ULONG_MAX) {
+		if (n == 8)
+			break;
+		seen[n] = entry;
+		at[n] = xas.xa_index;
+		order[n++] = cc_xas_get_order(&xas);
+		if (pausing)
+			cc_xas_pause(&xas);
+	}
+	cc_xas_clear_xa_node(&xas);
+	return n;
+}
+
 static unsigned int walk_marked(unsigned long start, void **seen)
 {
 	CC_XA_STATE(xas, XA, start);
@@ -893,6 +924,128 @@ static bool marked(unsigned long index)
 	ret = cc_xas_get_mark(&xas, CC_XA_MARK_0);
 	cc_xas_clear_xa_node(&xas);
 	return ret;
+}
+
+/*
+ * An entry of several leaves looks like one entry to the callers: a walk
+ * returns it once, its order is its real order, and its marks are found
+ * from any index inside it.
+ */
+static void far_walk(void)
+{
+	void *seen[8];
+	unsigned long at[8], index;
+	int order[8];
+	unsigned int n, i;
+	void *entry;
+
+	begin("far-walk");
+	EXPECT(!insert(FAR - 1, 0, &before));
+	EXPECT(!insert(FAR, WALK_ORDER, &big));
+	EXPECT(!insert(FAR + WALK_NR, 0, &after));
+
+	for (i = 0; i < 2; i++) {
+		n = walk(FAR - 1, seen, at, order, i);
+		EXPECT(n == 3 && seen[0] == &before && seen[1] == &big &&
+		       seen[2] == &after);
+		EXPECT(at[1] == FAR && order[1] == WALK_ORDER);
+		EXPECT(at[2] == FAR + WALK_NR && order[2] == 0);
+
+		/* A walk that starts inside the entry. */
+		n = walk(FAR + 130, seen, at, order, i);
+		EXPECT(n == 2 && seen[0] == &big && seen[1] == &after);
+		EXPECT(at[0] >= FAR + 130 && at[0] < FAR + WALK_NR);
+		EXPECT(order[0] == WALK_ORDER);
+	}
+	EXPECT(cc_xa_get_order(XA, FAR + 200) == WALK_ORDER);
+
+	/* The index based walk. */
+	n = 0;
+	cc_xa_for_each_start(XA, index, entry, FAR - 1)
+		n += entry == &big;
+	EXPECT(n == 1);
+
+	/* Skip by the size of the entry, as the read path does. */
+	{
+		CC_XA_STATE(xas, XA, FAR);
+
+		EXPECT(cc_xas_load(&xas, true) == &big);
+		cc_xas_advance(&xas, FAR + WALK_NR - 1);
+		EXPECT(cc_xas_next(&xas) == &after);
+		EXPECT(xas.xa_index == FAR + WALK_NR);
+		cc_xas_clear_xa_node(&xas);
+	}
+
+	/* Marks. */
+	EXPECT(!walk_marked(0, seen));
+	mark(FAR, true);
+	for (index = FAR; index < FAR + WALK_NR; index += 50)
+		EXPECT(marked(index));
+	EXPECT(!marked(FAR - 1) && !marked(FAR + WALK_NR));
+	EXPECT(walk_marked(0, seen) == 1 && seen[0] == &big);
+	EXPECT(walk_marked(FAR + 130, seen) == 1 && seen[0] == &big);
+	EXPECT(walk_marked(FAR + 192, seen) == 1 && seen[0] == &big);
+	index = FAR + 200;
+	EXPECT(cc_xa_find(XA, &index, ULONG_MAX, CC_XA_MARK_0) == &big);
+	EXPECT(!cc_xa_find_after(XA, &index, ULONG_MAX, CC_XA_MARK_0));
+	/* From the last index of a leaf, the next leaf is the same entry. */
+	for (i = 1; i < 4; i++) {
+		index = FAR + i * CC_XA_CHUNK_SIZE - 1;
+		EXPECT(!cc_xa_find_after(XA, &index, ULONG_MAX, CC_XA_MARK_0));
+		index = FAR + i * CC_XA_CHUNK_SIZE - 1;
+		EXPECT(cc_xa_find_after(XA, &index, ULONG_MAX,
+					CC_XA_PRESENT) == &after);
+		EXPECT(index == FAR + WALK_NR);
+	}
+	mark(FAR, false);
+	EXPECT(!walk_marked(0, seen));
+	EXPECT(!cc_xa_marked(XA, CC_XA_MARK_0));
+
+	/*
+	 * A folio split: the pieces inherit the marks.  Each later leaf then
+	 * gets a folio of its own.
+	 */
+	mark(FAR, true);
+	{
+		CC_XA_STATE_ORDER(xas, XA, FAR, CC_XA_CHUNK_SHIFT);
+
+		cc_xas_split(&xas, &big, WALK_ORDER);
+		EXPECT(!cc_xas_error(&xas));
+		cc_xas_clear_xa_node(&xas);
+	}
+	for (i = 0; i < 3; i++)
+		EXPECT(!store_order(FAR + (i + 1) * CC_XA_CHUNK_SIZE,
+				    CC_XA_CHUNK_SHIFT, &piece[i]));
+	n = walk(FAR, seen, at, order, false);
+	EXPECT(n == 5 && seen[0] == &big && seen[1] == &piece[0] &&
+	       seen[2] == &piece[1] && seen[3] == &piece[2] &&
+	       seen[4] == &after);
+	for (i = 0; i < 4; i++)
+		EXPECT(order[i] == CC_XA_CHUNK_SHIFT);
+	n = walk_marked(0, seen);
+	EXPECT(n == 4 && seen[0] == &big && seen[1] == &piece[0] &&
+	       seen[2] == &piece[1] && seen[3] == &piece[2]);
+	mark(FAR + 2 * CC_XA_CHUNK_SIZE, false);
+	n = walk_marked(0, seen);
+	EXPECT(n == 3 && seen[0] == &big && seen[1] == &piece[0] &&
+	       seen[2] == &piece[2]);
+	for (i = 0; i < 4; i++)
+		EXPECT(!erase(FAR + i * CC_XA_CHUNK_SIZE, CC_XA_CHUNK_SHIFT));
+	EXPECT(!walk_marked(0, seen));
+
+	/* Delete and evict leave no mark behind. */
+	EXPECT(!insert(FAR, WALK_ORDER, &big));
+	mark(FAR, true);
+	EXPECT(!erase(FAR, WALK_ORDER));
+	EXPECT(!walk_marked(0, seen));
+	EXPECT(!insert(FAR, WALK_ORDER, &big));
+	EXPECT(!marked(FAR + 100));
+	mark(FAR, true);
+	EXPECT(!store_order(FAR, WALK_ORDER, SHADOW));
+	EXPECT(!walk_marked(0, seen));
+	EXPECT(holds(FAR, WALK_NR, SHADOW) == WALK_NR);
+	EXPECT(walk(FAR, seen, at, order, false) == 8);
+	end();
 }
 
 /*
@@ -1063,6 +1216,7 @@ static void delete_range(void)
 			cc_xas_store_expected(&xas, NULL, &big);
 		} while (cc_xas_nomem(&xas, GFP_KERNEL));
 		EXPECT(!cc_xas_error(&xas));
+		EXPECT(cc_xas_get_order(&xas) == FAR_ORDER);
 		cc_xas_store(&xas, NULL);
 		EXPECT(!cc_xas_error(&xas));
 		cc_xas_clear_xa_node(&xas);
@@ -1554,6 +1708,7 @@ int main(int argc, char **argv)
 		{ "shadow-split-meets-refault", shadow_split_meets_refault },
 		{ "far-alone", far_alone },
 		{ "far-split", far_split },
+		{ "far-walk", far_walk },
 		{ "far-store-meets-insert", far_store_meets_insert },
 		{ "far-delete-meets-insert", far_delete_meets_insert },
 		{ "far-nomem", far_nomem },
