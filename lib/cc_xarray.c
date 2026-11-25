@@ -555,6 +555,18 @@ static void cc_xas_delete_node(struct cc_xa_state *xas)
 			break;
 		}
 
+		/*
+		 * The count was read before gc_flag was taken.  A store that
+		 * had already passed the gc_flag wait may have completed and
+		 * dropped its references since, and its entry must not end up
+		 * in a deleted node.  Stores that come later wait on gc_flag.
+		 */
+		if (__atomic_load_n(&node->count, __ATOMIC_SEQ_CST)) {
+			CC_XA_NODE_BUG_ON(node, !__sync_bool_compare_and_swap(&node->gc_flag, 1, 0));
+			cc_xas_set_xa_node(xas, node);
+			break;
+		}
+
 		parent = cc_xa_parent_locked(xas->xa, node);
 		//xas->xa_node = parent;
 		cc_xas_set_xa_node(xas, parent);
