@@ -332,6 +332,32 @@ Callers should also know the limits:
 * A reader that does not own the entry may see part of it while it is stored
   or deleted, and then gets a smaller order or the entry more than once.
 
+Where the order interfaces differ from the ordinary XArray
+---------------------------------------------------------
+
+The order interfaces are meant to behave as their ``xas_`` namesakes do;
+how the tree stores an entry is not part of that.  They differ in three
+places, each for a stated reason.
+
+* A value is one entry per index.  After a value is stored over a range,
+  ``cc_xas_get_order()`` of it is zero and a walk returns it once per index,
+  where the ordinary XArray has one entry of that order.  A multi-index entry
+  can only be taken apart without a lock by a single owner, and a shadow has
+  none: refault, reclaim and truncation all change it.  Giving it one would
+  need a gate on its canonical slot.  The result is the state the ordinary
+  XArray reaches once a large shadow has been split to order zero, which the
+  7.2.8 callers already handle.
+* A store of an order above zero can fail with ``-EEXIST`` after it has
+  displaced shadows, and those shadows are not put back.  ``xas_store()``
+  cannot fail there, because its caller holds the lock from the conflict scan
+  to the store.  Putting them back would need every order-0 insert to check
+  whether its leaf is being taken.  The only values in a CC mapping are
+  shadows, which reclaim may drop at any time; DAX and shmem, whose values
+  must not be lost, do not use CC mappings.
+* ``mapping_max_folio_order()`` stops a CC mapping one order below PMD size,
+  because khugepaged and the PMD mapping paths change ``i_pages`` with
+  ordinary XArray operations.
+
 Shadow cleanup
 ==============
 
