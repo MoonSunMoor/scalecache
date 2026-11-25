@@ -1064,6 +1064,110 @@ static void far_walk(void)
 	end();
 }
 
+static int halves[WALK_NR];
+static void *want[WALK_NR];
+static unsigned int want_order[WALK_NR];
+
+static void became(unsigned long start, unsigned int order, void *folio)
+{
+	unsigned long i;
+
+	for (i = 0; i < (1UL << order); i++) {
+		want[start + i] = folio;
+		want_order[start + i] = order;
+	}
+}
+
+/*
+ * The tree side of __folio_split() in mm/huge_memory.c for an order-8 folio:
+ * split the entry, in one step or one order at a time around @at, while
+ * every piece still holds the old folio, then give each after-split folio
+ * its slots.  The first piece keeps the old folio.
+ */
+static void folio_split(unsigned long at, unsigned int new_order, bool uniform)
+{
+	unsigned long start = 0, i, nr;
+	unsigned int order = WALK_ORDER, n = 0;
+	void *folio = &big, *seen[8];
+	int split;
+
+	printf("far-folio-split at=%lu order=%u %s\n", at, new_order,
+	       uniform ? "uniform" : "non-uniform");
+	cc_xa_init(XA);
+	EXPECT(!insert(FAR, WALK_ORDER, &big));
+	mark(FAR, true);
+	became(0, WALK_ORDER, &big);
+
+	for (split = uniform ? (int)new_order : (int)WALK_ORDER - 1;
+	     split >= (int)new_order; split--) {
+		CC_XA_STATE_ORDER(xas, XA, (FAR + start), split);
+
+		if (uniform)
+			cc_xas_split(&xas, &big, order);
+		else
+			cc_xas_try_split(&xas, &big, order);
+		EXPECT(!cc_xas_error(&xas));
+		cc_xas_clear_xa_node(&xas);
+		/* Readers still find the frozen old folio everywhere. */
+		EXPECT(holds(FAR, WALK_NR, &big) == WALK_NR);
+
+		nr = 1UL << split;
+		became(start, split, folio);
+		for (i = start + nr; i < start + (1UL << order); i += nr)
+			became(i, split, &halves[n++]);
+		if (!uniform && at >= start + nr) {
+			start += nr;
+			folio = want[start];
+		}
+		order = split;
+	}
+
+	/* The after-split folios, in address order as folio_next() gives. */
+	for (i = 0; i < WALK_NR; i += 1UL << want_order[i])
+		if (want[i] != &big)
+			EXPECT(!store_order(FAR + i, want_order[i], want[i]));
+
+	n = 0;
+	for (i = 0; i < WALK_NR; i++) {
+		EXPECT(peek(FAR + i) == want[i]);
+		EXPECT(marked(FAR + i));
+	}
+	for (i = 0; i < WALK_NR; i += 1UL << want_order[i]) {
+		EXPECT(cc_xa_get_order(XA, FAR + i) == want_order[i]);
+		n++;
+	}
+	{
+		CC_XA_STATE(xas, XA, 0);
+		unsigned int found = 0;
+		void *entry;
+
+		cc_xas_for_each(&xas, entry, ULONG_MAX)
+			found++;
+		cc_xas_clear_xa_node(&xas);
+		EXPECT(found == n);
+	}
+	far_counted(WALK_NR);
+	/* Each after-split folio is deleted on its own. */
+	for (i = 0; i < WALK_NR; i += 1UL << want_order[i])
+		EXPECT(!erase(FAR + i, want_order[i]));
+	EXPECT(holds(FAR, WALK_NR, NULL) == WALK_NR);
+	EXPECT(!walk_marked(0, seen));
+	end();
+}
+
+static void far_folio_split(void)
+{
+	static const unsigned long at[] = { 0, 70, 128, 255 };
+	static const unsigned int orders[] = { 0, 2, 5, 6, 7 };
+	unsigned int i, j;
+
+	for (i = 0; i < 4; i++)
+		for (j = 0; j < 5; j++)
+			folio_split(at[i], orders[j], false);
+	for (j = 0; j < 5; j++)
+		folio_split(0, orders[j], true);
+}
+
 /*
  * A store of several leaves fails for memory only before it has changed a
  * slot, as upstream xas_store() does: its leaves are created first.
@@ -1817,6 +1921,7 @@ int main(int argc, char **argv)
 		{ "far-alone", far_alone },
 		{ "far-split", far_split },
 		{ "far-walk", far_walk },
+		{ "far-folio-split", far_folio_split },
 		{ "far-store-meets-insert", far_store_meets_insert },
 		{ "far-delete-meets-insert", far_delete_meets_insert },
 		{ "far-nomem", far_nomem },

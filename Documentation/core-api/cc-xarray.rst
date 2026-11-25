@@ -300,6 +300,11 @@ Callers should also know the limits:
 * ``-EEXIST`` from ``cc_xas_split()``, or an error from the stores that give
   the pieces to their folios, means that the ownership rule was broken.
   There is no undo: leaves before the failing one are already split.
+* ``mm/huge_memory.c`` splits and stores with ``i_pages.xa_lock`` held and
+  interrupts off, which is what the node-update callback asserts.  Code it
+  calls for a CC mapping, such as the removal of after-split folios beyond
+  EOF, must use CC operations, must not take that lock again, and finds the
+  frozen old folio in the slots, not the folio it removes.
 * A lookup can still return an entry for the wrong index if, between its two
   reads, the entry is deleted and an entry of the same geometry is stored
   again.  Page cache lookups must keep checking that the folio they locked
