@@ -340,7 +340,8 @@ static void cc_case(const char *name)
 	}
 	CHECK(nr_allocated == allocated);
 	CHECK(freed == 0);
-	CHECK(cleared_slots == (marked ? 0 : writer ? count - 1 : count));
+	CHECK(cleared_slots == (marked ? 0 : writer ? count - 1 :
+				siblings ? count + 4 : count));
 	CHECK(stats[WORKINGSET_NODERECLAIM] == 0);
 	CHECK(!at_cas && !at_unlock);
 	if (writer) {
@@ -348,10 +349,6 @@ static void cc_case(const char *name)
 		CHECK(cc_xa_get_mark(CC_XARRAY(&mapping.i_pages), index, CC_XA_MARK_0));
 		CHECK(cc_xa_get_mark(CC_XARRAY(&mapping.i_pages), index, CC_XA_MARK_1));
 		CHECK(cc_xa_get_mark(CC_XARRAY(&mapping.i_pages), index, CC_XA_MARK_2));
-	} else if (siblings) {
-		for (i = 0; i < 4; i++)
-			CHECK(cc_xa_load(CC_XARRAY(&mapping.i_pages), i) == shadow);
-		CHECK(node->count == 4 && node->nr_values == 4 && !node->del);
 	} else if (marked) {
 		CHECK(node->count == 1 && node->nr_values == 1);
 		cc_xa_clear_mark(CC_XARRAY(&mapping.i_pages), index, CC_XA_MARK_0);
@@ -369,7 +366,7 @@ static void cc_case(const char *name)
 		cc_xas_clear_xa_node(&reader);
 	}
 	check_refs(cc_xa_to_node(CC_XARRAY(&mapping.i_pages)->xa_head));
-	CHECK(stats[WORKINGSET_NODES] == (siblings ? 1 : 0));
+	CHECK(stats[WORKINGSET_NODES] == 0);
 	finish(false);
 }
 
@@ -411,7 +408,9 @@ static void truncate_case(bool batch, const char *name)
 	bool bounds = !strcmp(name, "bounds");
 	bool siblings = !strcmp(name, "siblings");
 	bool higher = !strcmp(name, "higher-order");
-	bool preserved = marked || siblings || higher;
+	bool preserved = marked;
+	/* A shadow stored over a range is one entry per index. */
+	unsigned int in_range = siblings ? (batch ? 1 : 2) : 1;
 	unsigned long index = CC_XA_CHUNK_SIZE + 1, last;
 	unsigned long group_last = higher ? 2 * CC_XA_CHUNK_SIZE - 1 : 3;
 	unsigned int i;
@@ -522,7 +521,8 @@ static void truncate_case(bool batch, const char *name)
 		CHECK(cc_xa_load(xa, index) == (writer ? &live_entry :
 			changed ? cc_xa_mk_value(9) : preserved ? shadow : NULL));
 		CHECK(cleared_slots ==
-			(writer || changed || preserved ? 0 : bounds ? 2 : 1));
+			(writer || changed || preserved ? 0 : bounds ? 2 :
+			 in_range));
 		if (bounds) {
 			CHECK(cc_xa_load(xa, index - 2) == &leading_live);
 			CHECK(cc_xa_load(xa, index - 1) == shadow);
@@ -540,7 +540,8 @@ static void truncate_case(bool batch, const char *name)
 			CHECK(cc_xa_load(xa, group_last) == shadow);
 		}
 		if (node) {
-			unsigned int values = higher ? 2 : siblings ? 4 :
+			unsigned int values = higher ? CC_XA_CHUNK_SIZE - 1 :
+				siblings ? 4 - in_range :
 				bounds ? 2 : marked || changed ? 1 : 0;
 
 			if (changed)

@@ -242,18 +242,68 @@ Callers may rely on the following for order-greater-than-zero stores and
 deletes, and must not add compensation code:
 
 * A failed store or delete leaves no entry partially stored.  Nodes created
-  on the way may remain, as with the ordinary XArray.
-* A successful store or delete covers the whole range.
+  on the way may remain, as with the ordinary XArray.  This holds for a value
+  stored over a range too: the slots that still hold it are emptied again.
+* A store records ``-ENOMEM`` only before it has changed a slot, as upstream
+  does.  The leaves of an entry of several leaves are created before the
+  first slot is written, so the retry after ``cc_xas_nomem()`` finds the
+  range as the caller saw it.
+* A successful store or delete covers the whole range.  ``cc_xas_store()``
+  of ``NULL`` clears every slot of the range of the state, whatever it holds,
+  and the rest of an entry that begins in the range, as ``xas_store()`` does.
+  ``cc_xas_store_expected()`` of ``NULL`` names one entry and removes that
+  entry alone.
 * Other writers do not act on an intermediate state, for example by storing
   into the wrong slot.
 
 Upstream ``xas_store()`` fails only before it changes any slot, so the
-7.2.8 originals have no compensation code.  The first-stage implementation
-does not provide these guarantees: ``cc_xas_store()`` updates the slots one
-CAS at a time and can stop part way.  The path is not executed while large
-folios and DAX stay disabled for CC mappings.  Meeting these requirements is
-a precondition for enabling either.  If they cannot be met, both stay
-disabled and this contract does not change.
+7.2.8 originals have no compensation code.  ``cc_xas_store()`` changes the
+slots one CAS at a time and provides the guarantees as follows.
+
+* A store writes the canonical slot first and the sibling slots after it.
+  If a slot cannot be taken, it releases the slots in reverse order.  A
+  delete clears the sibling slots last to first and the canonical slot at
+  the end.  A sibling therefore never refers to a slot that does not hold
+  its entry.
+* A lookup that follows a sibling checks that the sibling is still there
+  after it has read the canonical slot.
+* ``cc_xas_store_expected()`` records ``-EEXIST`` when its index lies inside
+  another entry or when the canonical slot holds a larger entry.
+* A multi-index pointer entry is deleted, replaced or split only by its
+  owner, as the holder of a folio lock is.  The owner may replace it with
+  ``cc_xas_store()`` through a state of any order at any index of the entry,
+  as ``folio_migrate_mapping()`` does with an order-0 state: the new entry
+  takes every slot and every leaf of the old one and keeps its marks.
+  A value has no owner, so it is
+  never stored as a multi-index entry.  Storing a value over a range stores
+  it in every slot, and ``cc_xas_get_order()`` of a value is zero.
+
+Callers should also know the limits:
+
+* While a store or delete is in progress, a lookup may find the entry at
+  only part of its range, and ``cc_xas_get_order()`` may return a smaller
+  order.
+* Shadow values that an order-greater-than-zero store displaced before it
+  failed with ``-EEXIST`` are dropped, not restored.
+* A lookup can still return an entry for the wrong index if, between its two
+  reads, the entry is deleted and an entry of the same geometry is stored
+  again.  Page cache lookups must keep checking that the folio they locked
+  contains the index.
+* An entry of a leaf or more (order 6 and up with 64-slot nodes) is not
+  stored in a slot of an inner node, because a cc node stays linked to its
+  parent after it is deleted.  It fills every leaf of its range instead, with
+  a canonical slot of its own in each leaf.  A store fills the leaves first
+  to last and empties them again if one cannot be taken; a delete follows the
+  same pointer from leaf to leaf.  After a successful store or delete the
+  state keeps its index and order, as with ``xas_store()``, and its cursor is
+  at the first index of the range.
+* The marks of such an entry are kept in every leaf, so that a marked search
+  that starts inside the entry finds it and the pieces of a split inherit
+  them.  ``cc_xas_set_mark()`` and ``cc_xas_clear_mark()`` change all the
+  leaves when the state is at the canonical slot of one of them.  The caller
+  must serialise mark updates of one entry, as the page cache does.
+* A reader that does not own the entry may see part of it while it is stored
+  or deleted, and then gets a smaller order or the entry more than once.
 
 Shadow cleanup
 ==============

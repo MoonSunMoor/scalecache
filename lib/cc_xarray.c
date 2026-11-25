@@ -214,8 +214,19 @@ static __always_inline void *cc_xas_descend(struct cc_xa_state *xas,
 
 	//xas->xa_node = node;
 	cc_xas_set_xa_node(xas, node);
-	if (cc_xa_is_sibling(entry)) {
-		offset = cc_xa_to_sibling(entry);
+	/*
+	 * A sibling and the slot it refers to are read separately.  Writers
+	 * clear a sibling before they release its canonical slot, so the entry
+	 * belongs to this index only if the sibling is still there afterwards.
+	 */
+	while (cc_xa_is_sibling(entry)) {
+		void *sibling = entry;
+
+		entry = cc_xa_entry(xas->xa, node, cc_xa_to_sibling(sibling));
+		if (cc_xa_entry(xas->xa, node, offset) == sibling) {
+			offset = cc_xa_to_sibling(sibling);
+			break;
+		}
 		entry = cc_xa_entry(xas->xa, node, offset);
 	}
 
@@ -270,6 +281,57 @@ void *cc_xas_load(struct cc_xa_state *xas, bool rewind)
 	return entry;
 }
 EXPORT_SYMBOL_GPL(cc_xas_load);
+
+/*
+ * An entry of a leaf or more fills its leaves: it is in slot 0 of each of
+ * them and the last slot is a sibling of that.  Return the entry if @node is
+ * such a leaf.  A value never fills a leaf this way.
+ */
+static __always_inline void *cc_xa_leaf_entry(struct cc_xarray *xa,
+					      const struct cc_xa_node *node)
+{
+	void *entry;
+
+	if (cc_xas_not_node(node) || node->shift)
+		return NULL;
+	entry = cc_xa_entry(xa, node, 0);
+	if (!entry || cc_xa_is_internal(entry) || cc_xa_is_value(entry))
+		return NULL;
+	if (cc_xa_entry(xa, node, CC_XA_CHUNK_MASK) != cc_xa_mk_sibling(0))
+		return NULL;
+	return entry;
+}
+
+/* The same for the leaf that holds @index. */
+static void *cc_xa_leaf_entry_at(struct cc_xarray *xa, unsigned long index)
+{
+	CC_XA_STATE(xas, xa, index);
+	void *entry;
+
+	cc_xas_load(&xas, true);
+	entry = cc_xa_leaf_entry(xa, xas.xa_node);
+	cc_xas_clear_xa_node(&xas);
+	return entry;
+}
+
+/*
+ * The leaves that @entry fills around the leaf of @index, as the first index
+ * of the first one and of the last one.  The same pointer in the next leaf
+ * is the same entry.
+ */
+static void cc_xa_leaf_run(struct cc_xarray *xa, unsigned long index,
+			   void *entry, unsigned long *first,
+			   unsigned long *last)
+{
+	index &= ~(unsigned long)CC_XA_CHUNK_MASK;
+	*first = index;
+	*last = index;
+	while (*first && cc_xa_leaf_entry_at(xa, *first - 1) == entry)
+		*first -= CC_XA_CHUNK_SIZE;
+	while (*last + CC_XA_CHUNK_SIZE > *last &&
+	       cc_xa_leaf_entry_at(xa, *last + CC_XA_CHUNK_SIZE) == entry)
+		*last += CC_XA_CHUNK_SIZE;
+}
 
 #define CC_XA_RCU_FREE	((struct cc_xarray *)1)
 
@@ -941,17 +1003,330 @@ static void update_node(struct cc_xa_state *xas, struct cc_xa_node *node,
 		cc_xas_delete_node(xas);
 }
 
-/* Common body of cc_xas_store() and cc_xas_store_expected(). */
-static void *__cc_xas_store(struct cc_xa_state *xas, void *entry,
-			    bool expect, void *expected)
+static bool cc_xas_larger_entry(struct cc_xa_state *xas,
+				struct cc_xa_node *node, unsigned int max)
 {
+	return max < CC_XA_CHUNK_MASK &&
+	       cc_xa_entry_locked(xas->xa, node, max + 1) ==
+	       cc_xa_mk_sibling(xas->xa_offset);
+}
+
+/*
+ * Store the value @entry in every slot that @xas covers in @node.
+ *
+ * A value has no owner: any writer that expects it may replace or remove it.
+ * A writer working on the sibling slots of a multi-index value could not tell
+ * that the canonical slot changed hands meanwhile, so a value is never stored
+ * as a multi-index entry.  Each slot of the range holds @entry itself.
+ *
+ * With @whole, the canonical slot holds an entry of this range that the
+ * caller owns, as eviction of a folio does.  Its siblings are replaced last to
+ * first and the canonical slot at the end, so the siblings that remain still
+ * refer to that entry.
+ *
+ * Otherwise the canonical slot is written first.  If a slot cannot be taken,
+ * the slots that still hold @entry are emptied again; a slot that another
+ * writer took over meanwhile is left to it.
+ */
+static bool cc_xas_store_values(struct cc_xa_state *xas,
+				struct cc_xa_node *node, void **firstp,
+				void *entry, bool expect, bool whole,
+				int *count, int *values)
+{
+	unsigned int offset = xas->xa_offset;
+	unsigned int max = offset + xas->xa_sibs;
+	void *sibling = cc_xa_mk_sibling(offset);
+	void *first = *firstp, *curr;
+	unsigned long taken = 0, empty = 0, value = 0;
+	unsigned int i;
+
+	if (whole) {
+		for (i = max; i > offset; i--) {
+			if (__sync_val_compare_and_swap(&node->slots[i], sibling,
+							entry) == sibling)
+				*values += !cc_xa_is_value(first);
+		}
+		curr = __sync_val_compare_and_swap(&node->slots[offset], first,
+						   entry);
+		if (curr != first) {
+			*firstp = curr;
+			return false;
+		}
+		*values += !cc_xa_is_value(first);
+		return true;
+	}
+
+	curr = __sync_val_compare_and_swap(&node->slots[offset], first, entry);
+	if (curr != first) {
+		*firstp = curr;
+		return false;
+	}
+	if (cc_xa_is_node(first) && node->shift)
+		cc_xas_free_nodes(xas, cc_xa_to_node(first));
+	*count += !first;
+	*values += !cc_xa_is_value(first);
+
+	for (i = offset + 1; i <= max; i++) {
+		curr = cc_xa_entry_locked(xas->xa, node, i);
+		if (curr == entry)
+			continue;
+		if (expect && curr && !cc_xa_is_value(curr))
+			goto undo;
+		if (__sync_val_compare_and_swap(&node->slots[i], curr,
+						entry) != curr)
+			goto undo;
+		taken |= 1UL << i;
+		if (!curr)
+			empty |= 1UL << i;
+		if (cc_xa_is_value(curr))
+			value |= 1UL << i;
+		if (cc_xa_is_node(curr) && node->shift)
+			cc_xas_free_nodes(xas, cc_xa_to_node(curr));
+		*count += !curr;
+		*values += !cc_xa_is_value(curr);
+	}
+	return true;
+
+undo:
+	*firstp = curr;
+	*count = 0;
+	*values = 0;
+	while (--i > offset) {
+		if (!(taken & (1UL << i)))
+			continue;
+		if (__sync_val_compare_and_swap(&node->slots[i], entry,
+						NULL) == entry) {
+			*count -= !(empty & (1UL << i));
+			*values -= !!(value & (1UL << i));
+		} else {
+			*count += !!(empty & (1UL << i));
+			*values += !(value & (1UL << i));
+		}
+	}
+	if (__sync_val_compare_and_swap(&node->slots[offset], entry,
+					first) != entry) {
+		*count += !first;
+		*values += !cc_xa_is_value(first);
+	}
+	return false;
+}
+
+/*
+ * Store @entry over the slots that @xas covers in @node.
+ *
+ * The canonical slot is written first and every sibling slot refers to it, so
+ * a sibling never refers to a slot that does not hold @entry.  If a slot
+ * cannot be taken, the slots already written are released in reverse order
+ * and nothing of @entry remains.  Shadow values displaced before the failure
+ * are dropped rather than restored.  A value @entry is stored by
+ * cc_xas_store_values() instead.
+ *
+ * With @expect, a sibling slot is only taken when it is empty or holds a
+ * value.  On failure *@firstp is the entry that was in the way.
+ */
+static __always_inline bool
+cc_xas_store_slots(struct cc_xa_state *xas, struct cc_xa_node *node,
+		   void **firstp, void *entry, bool expect, int *count,
+		   int *values)
+{
+	unsigned int offset = xas->xa_offset;
+	unsigned int max = offset + xas->xa_sibs;
+	void *sibling = cc_xa_mk_sibling(offset);
+	void *first = *firstp, *prev = first, *curr;
+	bool value = cc_xa_is_value(entry);
+	unsigned long taken = 0;
+	int dropped = 0, dropped_values = 0;
+	bool whole = first && max > offset;
+	unsigned int i;
+
+	BUILD_BUG_ON(CC_XA_CHUNK_SIZE > BITS_PER_LONG);
+
+	/* Does the entry in the canonical slot already cover this range? */
+	for (i = offset + 1; whole && i <= max; i++)
+		whole = cc_xa_entry_locked(xas->xa, node, i) == sibling;
+
+	if (value && max > offset)
+		return cc_xas_store_values(xas, node, firstp, entry, expect,
+					   whole, count, values);
+
+	/*
+	 * A sibling past the range means the entry in the canonical slot is
+	 * larger than this store.  A caller that expects a certain entry splits
+	 * it first; taking the slot would hand it the rest of that range.
+	 */
+	if (expect && cc_xas_larger_entry(xas, node, max)) {
+		*firstp = sibling;
+		return false;
+	}
+
+	curr = __sync_val_compare_and_swap(&node->slots[offset], first, entry);
+	if (curr != first) {
+		*firstp = curr;
+		return false;
+	}
+	/* The same entry may have come back larger since the check above. */
+	if (expect && cc_xas_larger_entry(xas, node, max)) {
+		i = offset + 1;
+		curr = sibling;
+		goto undo;
+	}
+	if (cc_xa_is_node(first) && node->shift)
+		cc_xas_free_nodes(xas, cc_xa_to_node(first));
+	*count += !first;
+	*values += !cc_xa_is_value(first) - !value;
+
+	/*
+	 * The owner replaced its entry with one of the same range.  The
+	 * canonical slot was the whole store.
+	 */
+	if (whole && !expect) {
+		*values += (!cc_xa_is_value(first) - !value) * xas->xa_sibs;
+		return true;
+	}
+
+	for (i = offset + 1; i <= max; i++) {
+		curr = cc_xa_entry_locked(xas->xa, node, i);
+		if (!cc_xa_is_sibling(curr))
+			prev = curr;
+		if (curr != sibling) {
+			if (expect && curr && !cc_xa_is_value(curr))
+				goto undo;
+			if (__sync_val_compare_and_swap(&node->slots[i], curr,
+							sibling) != curr)
+				goto undo;
+			taken |= 1UL << i;
+			if (cc_xa_is_node(curr) && node->shift)
+				cc_xas_free_nodes(xas, cc_xa_to_node(curr));
+			if (curr) {
+				dropped++;
+				dropped_values += cc_xa_is_value(prev);
+			}
+		}
+		*count += !curr;
+		*values += !cc_xa_is_value(prev) - !value;
+	}
+	return true;
+
+undo:
+	*firstp = curr;
+	/* Nothing else may write a slot that refers to our canonical slot. */
+	while (--i > offset) {
+		if (!(taken & (1UL << i)))
+			continue;
+		curr = __sync_val_compare_and_swap(&node->slots[i], sibling,
+						   NULL);
+		CC_XA_NODE_BUG_ON(node, curr != sibling);
+	}
+	curr = __sync_val_compare_and_swap(&node->slots[offset], entry, first);
+	CC_XA_NODE_BUG_ON(node, curr != entry);
+	*count = -dropped;
+	*values = -dropped_values;
+	return false;
+}
+
+/*
+ * Clear the slots that @xas covers in @node, and the sibling slots that
+ * follow them.
+ *
+ * Sibling slots are cleared last-to-first and the canonical slot last, so a
+ * sibling never refers to a slot that another writer could have refilled.
+ * Only the canonical slot is compared with *@firstp.  The caller owns the
+ * entry, so that comparison fails only if this rule is broken; *@firstp then
+ * returns the entry found.
+ *
+ * With @range, every slot of the range of @xas is cleared whatever it holds,
+ * as xas_store() does for a NULL entry.  Otherwise the caller named one entry
+ * and only that entry goes.
+ */
+static bool cc_xas_erase_slots(struct cc_xa_state *xas,
+			       struct cc_xa_node *node, void **firstp,
+			       int *count, int *values, bool range, bool *full)
+{
+	unsigned int offset = xas->xa_offset;
+	unsigned int max = offset + xas->xa_sibs;
+	unsigned int last = max;
+	void *sibling = cc_xa_mk_sibling(offset);
+	void *first = *firstp, *curr;
+	bool filled;
+	unsigned int i;
+
+	/*
+	 * A value is never multi-index.  Siblings that refer to this slot
+	 * belong to an entry that replaced the value since it was loaded.
+	 */
+	if (cc_xa_is_value(first) && !range)
+		last = offset;
+
+	while (!cc_xa_is_value(first) && last < CC_XA_CHUNK_MASK &&
+	       cc_xa_entry_locked(xas->xa, node, last + 1) == sibling)
+		last++;
+	filled = first && !offset && last == CC_XA_CHUNK_MASK &&
+		 cc_xa_entry_locked(xas->xa, node, last) == sibling;
+
+	for (i = last; i > offset; i--) {
+		curr = __sync_val_compare_and_swap(&node->slots[i], sibling,
+						   NULL);
+		if (curr == sibling) {
+			(*count)--;
+			*values -= cc_xa_is_value(first);
+			continue;
+		}
+		/*
+		 * The slot does not belong to the entry in the canonical slot.
+		 * Past the range it is not ours to remove.
+		 */
+		if (!range || i > max)
+			continue;
+		while (curr) {
+			void *seen = curr;
+
+			curr = __sync_val_compare_and_swap(&node->slots[i],
+							   seen, NULL);
+			if (curr != seen)
+				continue;
+			(*count)--;
+			*values -= cc_xa_is_value(seen);
+			break;
+		}
+	}
+
+	curr = __sync_val_compare_and_swap(&node->slots[offset], first, NULL);
+	if (curr != first) {
+		*firstp = curr;
+		return false;
+	}
+	if (cc_xa_is_node(first) && node->shift)
+		cc_xas_free_nodes(xas, cc_xa_to_node(first));
+	*count -= !!first;
+	*values -= cc_xa_is_value(first);
+	*full = filled;
+	return true;
+}
+
+/* Common body of cc_xas_store() and cc_xas_store_expected(). */
+enum cc_xa_store_mode {
+	CC_XA_STORE_PLAIN,	/* the caller owns what it replaces */
+	CC_XA_STORE_EXACT,	/* the canonical slot must hold @expected */
+	CC_XA_STORE_VACANT,	/* the canonical slot must be empty or a value */
+};
+
+/*
+ * Store @entry in the node that the walk ends in.  *@full is set when a
+ * delete removed an entry that filled its leaf.
+ */
+static void cc_xas_init_slot_marks(const struct cc_xa_state *xas);
+
+static __always_inline void *
+__cc_xas_store_node(struct cc_xa_state *xas, void *entry,
+		    enum cc_xa_store_mode mode, void *expected, bool *full)
+{
+	bool expect = mode != CC_XA_STORE_PLAIN;
 	struct cc_xa_node *node;
 	void __rcu **slot = &xas->xa->xa_head;	// slot pointer
-	unsigned int offset, max;
 	int count = 0;
 	int values = 0;
-	void *first, *next;			// slot iterator
-	bool value = cc_xa_is_value(entry);
+	void *first, *curr;
+	bool stored;
 
 	if (entry) {
 		// entry is not node and not error -> then the new node could be root
@@ -963,70 +1338,282 @@ static void *__cc_xas_store(struct cc_xa_state *xas, void *entry,
 
 	if (cc_xas_invalid(xas))
 		goto out;
-	if (expect && first != expected) {
+	if (mode == CC_XA_STORE_EXACT ? first != expected :
+	    mode == CC_XA_STORE_VACANT && first && !cc_xa_is_value(first)) {
 		cc_xas_set_err(xas, -EEXIST);
 		goto out;
 	}
 	node = xas->xa_node;
+	/*
+	 * The walk followed a sibling, so this index lies inside another
+	 * entry.  A caller that does not own that entry must not write to its
+	 * canonical slot; it splits the entry first, as upstream does.
+	 */
+	if (expect && node &&
+	    xas->xa_offset != get_offset(xas->xa_index, node)) {
+		cc_xas_set_err(xas, -EEXIST);
+		goto out;
+	}
 	if (node && (xas->xa_shift < node->shift))
 		xas->xa_sibs = 0;
 	if ((first == entry) && !xas->xa_sibs)	// No need to update slot! It's already same!
 		goto out;
 
-	next = first;
-	offset = xas->xa_offset;		// update offset, the slot mask
-	max = xas->xa_offset + xas->xa_sibs;	// max number of leaves
 	if (node) {
-		slot = &node->slots[offset];	// get slot pointer
-		if (xas->xa_sibs)
+		slot = &node->slots[xas->xa_offset];
+		if (xas->xa_sibs) {
 			cc_xas_squash_marks(xas);
+			/* Values are one entry per index and carry no mark. */
+			if (cc_xa_is_value(entry))
+				cc_xas_init_slot_marks(xas);
+		}
 	}
+	/*
+	 * Must clear the marks before setting the entry to NULL, otherwise
+	 * cc_xas_for_each_marked may find a NULL entry and stop early.
+	 */
 	if (!entry)
-		cc_xas_init_marks(xas);
+		cc_xas_init_slot_marks(xas);
 
-	for (;;) {
-		void *curr;
-		/*
-		 * Must clear the marks before setting the entry to NULL,
-		 * otherwise cc_xas_for_each_marked may find a NULL entry and
-		 * stop early.  rcu_assign_pointer contains a release barrier
-		 * so the mark clearing will appear to happen before the
-		 * entry is set to NULL.
-		 */
-		 
-		/* Perform CAS */
-		if ((curr = __sync_val_compare_and_swap(slot, next, entry)) != next) {
+	if (!node) {
+		curr = __sync_val_compare_and_swap(slot, first, entry);
+		if (curr != first) {
 			cc_xas_set_err(xas, -EEXIST);
 			first = curr;
-			goto out;
+		} else if (cc_xa_is_node(first)) {	// coming from scan_shadow_nodes()
+			cc_xas_free_nodes(xas, cc_xa_to_node(first));
 		}
-		if (cc_xa_is_node(next) && (!node || node->shift))	// coming from scan_shadow_nodes()
-			cc_xas_free_nodes(xas, cc_xa_to_node(next));
-		if (!node)
-			break;
-		count += !next - !entry;
-		values += !cc_xa_is_value(first) - !value;
-		if (entry) {	// insert
-			if (offset == max)		// single index entry
-				break;
-			if (!cc_xa_is_sibling(entry))	// multi index entry
-				entry = cc_xa_mk_sibling(xas->xa_offset);
-		} else {	// delete
-			if (offset == CC_XA_CHUNK_MASK)
-				break;
-		}
-		next = cc_xa_entry_locked(xas->xa, node, ++offset);
-		if (!cc_xa_is_sibling(next)) {
-			if (!entry && (offset > max))
-				break;
-			first = next;
-		}
-		slot++;
+		goto out;
 	}
 
+	curr = first;
+	if (entry)
+		stored = cc_xas_store_slots(xas, node, &curr, entry, expect,
+					    &count, &values);
+	else
+		stored = cc_xas_erase_slots(xas, node, &curr, &count, &values,
+					    mode == CC_XA_STORE_PLAIN, full);
+
+	/* The error state replaces the cursor, so account for the slots first. */
 	update_node(xas, node, count, values);
+	if (!stored) {
+		cc_xas_set_err(xas, -EEXIST);
+		first = curr;
+	}
 out:
 	cc_xas_rewind_refcnt(xas);
+	return first;
+}
+
+/* The same out of line, for the stores that go from leaf to leaf. */
+static noinline void *cc_xas_store_node(struct cc_xa_state *xas, void *entry,
+					enum cc_xa_store_mode mode,
+					void *expected, bool *full)
+{
+	return __cc_xas_store_node(xas, entry, mode, expected, full);
+}
+
+/*
+ * Undo of a value stored over the leaf at the cursor: empty the slots that
+ * still hold it.  A slot that another writer took over is left to it.
+ */
+static void cc_xas_erase_values(struct cc_xa_state *xas, void *entry)
+{
+	struct cc_xa_node *node;
+	int count = 0, values = 0;
+	unsigned int i;
+
+	cc_xas_load(xas, false);
+	node = xas->xa_node;
+	if (!cc_xas_invalid(xas) && node && !node->shift) {
+		for (i = CC_XA_CHUNK_SIZE; i--;) {
+			if (__sync_val_compare_and_swap(&node->slots[i], entry,
+							NULL) != entry)
+				continue;
+			count--;
+			values--;
+		}
+		update_node(xas, node, count, values);
+	}
+	cc_xas_rewind_refcnt(xas);
+}
+
+/* Point @xas at the whole leaf that holds @index. */
+static void cc_xas_set_leaf(struct cc_xa_state *xas, unsigned long index)
+{
+	xas->xa_index = index & ~(unsigned long)CC_XA_CHUNK_MASK;
+	xas->xa_shift = 0;
+	xas->xa_sibs = CC_XA_CHUNK_MASK;
+	cc_xas_set_xa_node(xas, CC_XAS_RESTART);
+}
+
+/*
+ * The entry @first filled the leaf at the cursor and has been removed from
+ * it.  Remove it from the leaves that follow.  The same pointer in the next
+ * leaf is the same entry, so this needs no order from the caller.
+ */
+static void cc_xas_erase_leaves(struct cc_xa_state *xas, void *first)
+{
+	unsigned long index = xas->xa_index;
+	unsigned long next = index | CC_XA_CHUNK_MASK;
+	unsigned char shift = xas->xa_shift, sibs = xas->xa_sibs;
+	bool full = true;
+
+	while (full && ++next) {
+		full = false;
+		cc_xas_set_leaf(xas, next);
+		cc_xas_store_node(xas, NULL, CC_XA_STORE_EXACT, first, &full);
+		next |= CC_XA_CHUNK_MASK;
+	}
+	/* Back to the slot the caller emptied; the last probe found the end. */
+	xas->xa_shift = shift;
+	xas->xa_sibs = sibs;
+	cc_xas_set(xas, index);
+	cc_xas_load(xas, true);
+}
+
+/*
+ * The owner replaced @first with @entry through a state of less than a leaf,
+ * and @first filled the leaf at the cursor.  Replace it in the other leaves
+ * it fills, as a store to the canonical slot of a smaller entry replaces all
+ * of that entry.  The same pointer in the next leaf is the same entry.
+ */
+static void cc_xas_replace_leaves(struct cc_xa_state *xas, void *first,
+				  void *entry)
+{
+	unsigned long index = xas->xa_index;
+	unsigned long leaf = index & ~(unsigned long)CC_XA_CHUNK_MASK;
+	unsigned char shift = xas->xa_shift, sibs = xas->xa_sibs;
+	unsigned long at;
+	bool full;
+
+	for (at = leaf + CC_XA_CHUNK_SIZE;
+	     at && cc_xa_leaf_entry_at(xas->xa, at) == first;
+	     at += CC_XA_CHUNK_SIZE) {
+		cc_xas_set_leaf(xas, at);
+		cc_xas_store_node(xas, entry, CC_XA_STORE_PLAIN, NULL, &full);
+	}
+	for (at = leaf; at && cc_xa_leaf_entry_at(xas->xa, at - 1) == first;) {
+		at -= CC_XA_CHUNK_SIZE;
+		cc_xas_set_leaf(xas, at);
+		cc_xas_store_node(xas, entry, CC_XA_STORE_PLAIN, NULL, &full);
+	}
+	xas->xa_shift = shift;
+	xas->xa_sibs = sibs;
+	cc_xas_set(xas, index);
+	cc_xas_load(xas, true);
+}
+
+/*
+ * cc nodes are deleted logically and stay linked to their parent, so a slot
+ * of an inner node cannot be given to an entry.  An entry of a leaf or more
+ * is stored in the leaves instead: it fills each leaf of its range, with a
+ * canonical slot of its own in every leaf.
+ *
+ * The leaves are filled first to last and emptied again last to first if one
+ * of them cannot be taken, so a failed store leaves nothing of @entry.  The
+ * first leaf obeys @expect; the others must be empty or hold values.  On
+ * success the cursor is at the first leaf and describes that leaf.
+ */
+static void *__cc_xas_store(struct cc_xa_state *xas, void *entry,
+			    bool expect, void *expected)
+{
+	enum cc_xa_store_mode mode = expect ? CC_XA_STORE_EXACT :
+					      CC_XA_STORE_PLAIN;
+	unsigned char shift = xas->xa_shift, sibs = xas->xa_sibs;
+	unsigned long base, leaves, i;
+	void *first = NULL, *curr;
+	bool full = false;
+	long err;
+
+	if (shift < CC_XA_CHUNK_SHIFT || cc_xas_error(xas)) {
+		first = __cc_xas_store_node(xas, entry, mode, expected, &full);
+		if (cc_xas_error(xas))
+			return first;
+		if (full)
+			cc_xas_erase_leaves(xas, first);
+		else if (entry && !expect && first != entry && !xas->xa_offset &&
+			 first && !cc_xa_is_internal(first) &&
+			 !cc_xa_is_value(first) &&
+			 cc_xa_leaf_entry(xas->xa, xas->xa_node) == entry)
+			cc_xas_replace_leaves(xas, first, entry);
+		return first;
+	}
+
+	base = xas->xa_index & ~(((sibs + 1UL) << shift) - 1);
+	leaves = (sibs + 1UL) << (shift - CC_XA_CHUNK_SHIFT);
+
+	if (!entry) {
+		/*
+		 * A delete that names its entry follows that entry from its
+		 * first leaf.  Otherwise every leaf of the range is cleared,
+		 * and the rest of an entry that goes on after the last one.
+		 */
+		for (i = 0; i < leaves; i++) {
+			cc_xas_set_leaf(xas, base + i * CC_XA_CHUNK_SIZE);
+			curr = cc_xas_store_node(xas, NULL, mode, expected,
+						 &full);
+			if (!i)
+				first = curr;
+			if (expect || cc_xas_error(xas))
+				break;
+		}
+		if (cc_xas_error(xas))
+			return first;
+		if (full)
+			cc_xas_erase_leaves(xas, curr);
+		goto done;
+	}
+
+	/*
+	 * Create the leaves first.  Nodes stay once they are linked, so the
+	 * stores below find every node: like upstream xas_store(), this can
+	 * only fail for memory before it has changed a slot.
+	 */
+	for (i = 1; i < leaves; i++) {
+		cc_xas_set_leaf(xas, base + i * CC_XA_CHUNK_SIZE);
+		cc_xas_create(xas, true);
+		cc_xas_rewind_refcnt(xas);
+		if (cc_xas_error(xas)) {
+			err = cc_xas_error(xas);
+			goto fail;
+		}
+	}
+
+	for (i = 0; i < leaves; i++) {
+		cc_xas_set_leaf(xas, base + i * CC_XA_CHUNK_SIZE);
+		curr = cc_xas_store_node(xas, entry, mode, expected, &full);
+		if (!i)
+			first = curr;
+		if (cc_xas_error(xas))
+			break;
+		if (expect)
+			mode = CC_XA_STORE_VACANT;
+	}
+	if (i == leaves) {
+done:
+		/* The state keeps its range; the cursor is at its start. */
+		cc_xas_set_leaf(xas, base);
+		cc_xas_load(xas, true);
+		xas->xa_shift = shift;
+		xas->xa_sibs = sibs;
+		return first;
+	}
+
+	err = cc_xas_error(xas);
+	while (i--) {
+		cc_xas_set_leaf(xas, base + i * CC_XA_CHUNK_SIZE);
+		if (cc_xa_is_value(entry))
+			cc_xas_erase_values(xas, entry);
+		else
+			cc_xas_store_node(xas, NULL, CC_XA_STORE_EXACT, entry,
+					  &full);
+	}
+fail:
+	xas->xa_index = base;
+	xas->xa_shift = shift;
+	xas->xa_sibs = sibs;
+	cc_xas_set_err(xas, err);
 	return first;
 }
 
@@ -1193,23 +1780,93 @@ bool cc_xas_get_mark(const struct cc_xa_state *xas, cc_xa_mark_t mark)
  * on all the ancestor entries.  Does nothing if @xas has not been walked to
  * an entry, or is in an error state.
  */
-void cc_xas_set_mark(const struct cc_xa_state *xas, cc_xa_mark_t mark)
+static __always_inline void cc_node_set_mark(struct cc_xarray *xa,
+		struct cc_xa_node *node, unsigned int offset, cc_xa_mark_t mark)
 {
-	struct cc_xa_node *node = xas->xa_node;
-	unsigned int offset = xas->xa_offset;
-
-	if (cc_xas_invalid(xas))
-		return;
-
 	while (node) {
 		if (node_set_mark(node, offset, mark))
 			return;
 		offset = node->offset;
-		node = cc_xa_parent_locked(xas->xa, node);
+		node = cc_xa_parent_locked(xa, node);
 	}
 
-	if (!cc_xa_marked(xas->xa, mark))
-		cc_xa_mark_set(xas->xa, mark);
+	if (!cc_xa_marked(xa, mark))
+		cc_xa_mark_set(xa, mark);
+}
+
+static __always_inline void cc_node_clear_mark(struct cc_xarray *xa,
+		struct cc_xa_node *node, unsigned int offset, cc_xa_mark_t mark)
+{
+	while (node) {
+		if (!node_clear_mark(node, offset, mark))
+			return;
+		if (node_any_mark(node, mark))
+			return;
+
+		offset = node->offset;
+		node = cc_xa_parent_locked(xa, node);
+	}
+
+	if (cc_xa_marked(xa, mark))
+		cc_xa_mark_clear(xa, mark);
+}
+
+/*
+ * An entry of more than one leaf has a canonical slot in each leaf, and a
+ * search that starts inside the entry only looks at the leaves from there
+ * on.  So every leaf carries the marks of the entry.
+ */
+static noinline void cc_xas_mark_leaves(const struct cc_xa_state *xas,
+					void *entry, cc_xa_mark_t mark,
+					bool set)
+{
+	struct cc_xarray *xa = xas->xa;
+	unsigned long first, last, index;
+
+	cc_xa_leaf_run(xa, xas->xa_index, entry, &first, &last);
+	for (index = first; ; index += CC_XA_CHUNK_SIZE) {
+		if (index != (xas->xa_index & ~(unsigned long)CC_XA_CHUNK_MASK)) {
+			CC_XA_STATE(leaf, xa, index);
+
+			cc_xas_load(&leaf, true);
+			if (cc_xa_leaf_entry(xa, leaf.xa_node) != entry)
+				;
+			else if (set)
+				cc_node_set_mark(xa, leaf.xa_node, 0, mark);
+			else
+				cc_node_clear_mark(xa, leaf.xa_node, 0, mark);
+			cc_xas_clear_xa_node(&leaf);
+		}
+		if (index == last)
+			break;
+	}
+}
+
+/* Kept in the callers: an entry of less than a leaf ends here. */
+static __always_inline void cc_xas_mark(const struct cc_xa_state *xas,
+					cc_xa_mark_t mark, bool set)
+{
+	struct cc_xarray *xa = xas->xa;
+	void *entry;
+
+	if (cc_xas_invalid(xas))
+		return;
+
+	if (set)
+		cc_node_set_mark(xa, xas->xa_node, xas->xa_offset, mark);
+	else
+		cc_node_clear_mark(xa, xas->xa_node, xas->xa_offset, mark);
+
+	if (xas->xa_offset)
+		return;
+	entry = cc_xa_leaf_entry(xa, xas->xa_node);
+	if (entry)
+		cc_xas_mark_leaves(xas, entry, mark, set);
+}
+
+void cc_xas_set_mark(const struct cc_xa_state *xas, cc_xa_mark_t mark)
+{
+	cc_xas_mark(xas, mark, true);
 }
 EXPORT_SYMBOL_GPL(cc_xas_set_mark);
 
@@ -1224,24 +1881,7 @@ EXPORT_SYMBOL_GPL(cc_xas_set_mark);
  */
 void cc_xas_clear_mark(const struct cc_xa_state *xas, cc_xa_mark_t mark)
 {
-	struct cc_xa_node *node = xas->xa_node;
-	unsigned int offset = xas->xa_offset;
-
-	if (cc_xas_invalid(xas))
-		return;
-
-	while (node) {
-		if (!node_clear_mark(node, offset, mark))
-			return;
-		if (node_any_mark(node, mark))
-			return;
-
-		offset = node->offset;
-		node = cc_xa_parent_locked(xas->xa, node);
-	}
-
-	if (cc_xa_marked(xas->xa, mark))
-		cc_xa_mark_clear(xas->xa, mark);
+	cc_xas_mark(xas, mark, false);
 }
 //EXPORT_SYMBOL_GPL(cc_xas_clear_mark);
 
@@ -1271,6 +1911,27 @@ void cc_xas_init_marks(const struct cc_xa_state *xas)
 	}
 }
 EXPORT_SYMBOL_GPL(cc_xas_init_marks);
+
+/* cc_xas_init_marks() for the slot of the cursor alone. */
+static void cc_xas_init_slot_marks(const struct cc_xa_state *xas)
+{
+	cc_xa_mark_t mark = 0;
+
+	if (cc_xas_invalid(xas))
+		return;
+
+	for (;;) {
+		if (cc_xa_track_free(xas->xa) && mark == CC_XA_FREE_MARK)
+			cc_node_set_mark(xas->xa, xas->xa_node,
+					 xas->xa_offset, mark);
+		else
+			cc_node_clear_mark(xas->xa, xas->xa_node,
+					   xas->xa_offset, mark);
+		if (mark == CC_XA_MARK_MAX)
+			break;
+		mark_inc(mark);
+	}
+}
 
 #ifdef CONFIG_XARRAY_MULTI
 static unsigned int node_get_marks(struct cc_xa_node *node, unsigned int offset)

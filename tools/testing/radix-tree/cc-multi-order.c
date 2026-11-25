@@ -54,6 +54,9 @@ static struct xarray tree;
 #define XA CC_XARRAY(&tree)
 
 static int anchor, big, other;
+static unsigned long other_index;
+static int other_err;
+static bool wrong_index;
 static unsigned int failures;
 static unsigned int nr_runs, nr_partial;
 
@@ -111,6 +114,23 @@ static unsigned int occupied(struct cc_xa_node *node)
 	return nr;
 }
 
+static void show(const char *when, struct cc_xa_node *node)
+{
+	unsigned long i;
+
+	printf("  %s:", when);
+	for (i = 0; i < NR; i++) {
+		void *entry = node->slots[BASE + i];
+
+		printf(" [%lu]=%s", BASE + i,
+		       !entry ? "empty" :
+		       cc_xa_is_sibling(entry) ? "sibling" :
+		       entry == &big ? "big" :
+		       entry == &other ? "other" : "?");
+	}
+	printf(" count=%u occupied=%u\n", node->count, occupied(node));
+}
+
 static struct cc_xa_node *begin(const char *name)
 {
 	printf("%s\n", name);
@@ -137,12 +157,166 @@ static void *peek(unsigned long index)
 	return entry;
 }
 
+/* "Other writers do not act on an intermediate state." */
+static void insert_other(void)
+{
+	unsigned long i, bigs = 0;
+
+	for (i = 0; i < NR; i++)
+		bigs += peek(BASE + i) == &big;
+	/* Allowed: a reader may see the entry at only part of its range. */
+	nr_partial += bigs && bigs < NR;
+
+	other_err = insert(other_index, 0, &other);
+	for (i = 0; i < NR; i++) {
+		if (BASE + i != other_index && peek(BASE + i) == &other)
+			wrong_index = true;
+	}
+}
+
+static void arm(struct cc_xa_node *node, unsigned int cas, unsigned long at)
+{
+	other_index = BASE + at;
+	other_err = 1;
+	wrong_index = false;
+	watched_first = (void **)&node->slots[BASE];
+	watched_last = (void **)&node->slots[BASE + NR - 1];
+	countdown = cas;
+	intruder = insert_other;
+}
+
+/* False once the operation finished before its cas-th CAS. */
+static bool fired(void)
+{
+	bool ran = !intruder;
+
+	intruder = NULL;
+	nr_runs += ran;
+	return ran;
+}
+
+/* What every index must hold once both writers have returned. */
+static void settled(struct cc_xa_node *node, bool big_present)
+{
+	unsigned long i;
+
+	EXPECT(other_err == 0 || other_err == -EEXIST);
+	EXPECT(!wrong_index);
+	for (i = 0; i < NR; i++) {
+		void *want = big_present ? &big : NULL;
+
+		if (!other_err && BASE + i == other_index)
+			want = &other;
+		EXPECT(cc_xa_load(XA, BASE + i) == want);
+	}
+	EXPECT(!(big_present && !other_err));
+	EXPECT(node->count == occupied(node));
+	EXPECT(!node->refcnt);
+}
+
+/* No second writer: the fixture itself must agree with the contract. */
+static void alone(void)
+{
+	struct cc_xa_node *node = begin("alone");
+
+	other_err = -EEXIST;
+	wrong_index = false;
+	EXPECT(!insert(BASE, ORDER, &big));
+	show("after store", node);
+	settled(node, true);
+	EXPECT(!erase(BASE, ORDER));
+	show("after delete", node);
+	settled(node, false);
+	end();
+}
+
+/* "A failed store or delete leaves no entry partially stored." */
+static void store_meets_insert(void)
+{
+	unsigned int cas;
+	unsigned long at;
+	bool ran = true;
+
+	for (cas = 0; ran; cas++) {
+		for (at = 0; at < NR; at++) {
+			char name[64];
+			struct cc_xa_node *node;
+			int err;
+
+			snprintf(name, sizeof(name),
+				 "store-meets-insert cas=%u insert=%lu",
+				 cas, BASE + at);
+			node = begin(name);
+			arm(node, cas, at);
+			err = insert(BASE, ORDER, &big);
+			ran = fired();
+			if (!ran)
+				other_err = -EEXIST;
+			show("after store", node);
+			printf("  store error %d, insert error %d\n", err,
+			       other_err);
+			EXPECT(err == 0 || err == -EEXIST);
+			settled(node, !err);
+			end();
+		}
+	}
+}
+
+/* "A successful store or delete covers the whole range." */
+static void delete_meets_insert(void)
+{
+	unsigned int cas;
+	unsigned long at;
+	bool ran = true;
+
+	for (cas = 0; ran; cas++) {
+		for (at = 0; at < NR; at++) {
+			char name[64];
+			struct cc_xa_node *node;
+
+			snprintf(name, sizeof(name),
+				 "delete-meets-insert cas=%u insert=%lu",
+				 cas, BASE + at);
+			node = begin(name);
+			if (insert(BASE, ORDER, &big))
+				abort();
+			arm(node, cas, at);
+			EXPECT(!erase(BASE, ORDER));
+			ran = fired();
+			if (!ran)
+				other_err = -EEXIST;
+			show("after delete", node);
+			printf("  insert error %d\n", other_err);
+			settled(node, false);
+			end();
+		}
+	}
+}
+
 /*
  * A shadow is never multi-index: storing one over a range stores it in every
  * slot.  The split cases with a shadow therefore find nothing to split, and
  * check that a split attempted on stale information does no harm.
  */
 #define SHADOW	cc_xa_mk_value(7)
+
+static int split_entry(void *entry)
+{
+	CC_XA_STATE(xas, XA, BASE);
+	int err;
+
+	do {
+		cc_xas_try_split(&xas, entry, ORDER);
+	} while (cc_xas_nomem(&xas, GFP_KERNEL));
+	err = cc_xas_error(&xas);
+	cc_xas_clear_xa_node(&xas);
+	return err;
+}
+
+static int split(void)
+{
+	return split_entry(SHADOW);
+}
 
 static int replace_shadow(unsigned long index, void *entry)
 {
@@ -169,11 +343,87 @@ static unsigned int value_slots(struct cc_xa_node *node)
 	return nr;
 }
 
+static void show_split(const char *when, struct cc_xa_node *node)
+{
+	unsigned long i;
+
+	printf("  %s:", when);
+	for (i = 0; i < NR; i++) {
+		void *entry = node->slots[BASE + i];
+
+		printf(" [%lu]=%s", BASE + i,
+		       !entry ? "empty" :
+		       cc_xa_is_sibling(entry) ? "sibling" :
+		       entry == SHADOW ? "shadow" :
+		       entry == &other ? "other" : "?");
+	}
+	printf(" count=%u occupied=%u values=%u value-slots=%u\n", node->count,
+	       occupied(node), node->nr_values, value_slots(node));
+}
+
 static void counted(struct cc_xa_node *node)
 {
 	EXPECT(node->count == occupied(node));
 	EXPECT(node->nr_values == value_slots(node));
 	EXPECT(!node->refcnt);
+}
+
+/* A second inserter takes one index, whatever it finds there. */
+static void take_index(void)
+{
+	unsigned long i;
+
+	other_err = replace_shadow(other_index, &other);
+	if (other_err)
+		other_err = insert(other_index, 0, &other);
+	for (i = 0; i < NR; i++) {
+		if (BASE + i != other_index && peek(BASE + i) == &other)
+			wrong_index = true;
+	}
+}
+
+/* The owner of a folio replaces it with shadows, as eviction does. */
+static void evict_meets_insert(void)
+{
+	unsigned int write;
+	unsigned long at, i;
+	bool ran = true;
+
+	for (write = 0; ran; write++) {
+		for (at = 0; at < NR; at++) {
+			CC_XA_STATE_ORDER(xas, XA, BASE, ORDER);
+			char name[64];
+			struct cc_xa_node *node;
+
+			snprintf(name, sizeof(name),
+				 "evict-meets-insert write=%u insert=%lu",
+				 write, BASE + at);
+			node = begin(name);
+			if (insert(BASE, ORDER, &big))
+				abort();
+			arm(node, write, at);
+			intruder = take_index;
+			cc_xas_store(&xas, SHADOW);
+			EXPECT(!cc_xas_error(&xas));
+			cc_xas_clear_xa_node(&xas);
+			ran = fired();
+			if (!ran)
+				other_err = -EEXIST;
+			show_split("after evict", node);
+			printf("  insert error %d\n", other_err);
+			EXPECT(other_err == 0 || other_err == -EEXIST);
+			EXPECT(!wrong_index);
+			for (i = 0; i < NR; i++) {
+				void *want = SHADOW;
+
+				if (!other_err && i == at)
+					want = &other;
+				EXPECT(node->slots[BASE + i] == want);
+			}
+			counted(node);
+			end();
+		}
+	}
 }
 
 /*
@@ -234,6 +484,381 @@ static int store_order(unsigned long index, unsigned int order, void *entry)
 	return err;
 }
 
+static void mark(unsigned long index, bool set);
+static bool marked(unsigned long index);
+
+static void far_alone(void)
+{
+	unsigned int order;
+
+	for (order = CC_XA_CHUNK_SHIFT; order <= 8; order++) {
+		CC_XA_STATE_ORDER(xas, XA, FAR, order);
+		unsigned long nr = 1UL << order;
+		char name[64];
+
+		snprintf(name, sizeof(name), "far-alone order=%u", order);
+		begin(name);
+		other_err = -EEXIST;
+		/* The leaves exist, deleted: an entry was here before. */
+		EXPECT(!insert(FAR + 70, 0, &other));
+		EXPECT(!erase(FAR + 70, 0));
+		EXPECT(!insert(FAR + 5, 0, &other));
+		EXPECT(!erase(FAR + 5, 0));
+
+		EXPECT(!insert(FAR, order, &big));
+		EXPECT(holds(FAR, nr, &big) == nr);
+		EXPECT(!cc_xa_load(XA, FAR - 1) && !cc_xa_load(XA, FAR + nr));
+		far_counted(nr);
+		/* An occupied range refuses a second entry and keeps the first. */
+		EXPECT(insert(FAR, order, &other) == -EEXIST);
+		EXPECT(insert(FAR + nr - 1, 0, &other) == -EEXIST);
+		EXPECT(holds(FAR, nr, &big) == nr);
+
+		/* Delete with the order, as page_cache_delete() does. */
+		EXPECT(!erase(FAR, order));
+		EXPECT(holds(FAR, nr, NULL) == nr);
+
+		/*
+		 * Replace from one index alone, as a migration does: the
+		 * new entry takes every leaf, and the marks stay.
+		 */
+		EXPECT(!insert(FAR, order, &big));
+		mark(FAR, true);
+		EXPECT(!store_order(FAR, 0, &other));
+		EXPECT(holds(FAR, nr, &other) == nr);
+		EXPECT(!store_order(FAR + nr - 1, 0, &big));
+		EXPECT(holds(FAR, nr, &big) == nr);
+		EXPECT(marked(FAR) && marked(FAR + nr - 1));
+		EXPECT(!cc_xa_load(XA, FAR - 1) && !cc_xa_load(XA, FAR + nr));
+		far_counted(nr);
+		EXPECT(!erase(FAR, order));
+		EXPECT(holds(FAR, nr, NULL) == nr);
+
+		/* Delete from the first index alone, as a batch delete does. */
+		EXPECT(!insert(FAR, order, &big));
+		EXPECT(!erase(FAR, 0));
+		EXPECT(holds(FAR, nr, NULL) == nr);
+
+		/* One index in the way refuses the whole entry. */
+		EXPECT(!insert(FAR + nr - 1, 0, &other));
+		EXPECT(insert(FAR, order, &big) == -EEXIST);
+		EXPECT(holds(FAR, nr, &big) == 0);
+		EXPECT(cc_xa_load(XA, FAR + nr - 1) == &other);
+		far_counted(nr);
+		EXPECT(!erase(FAR + nr - 1, 0));
+
+		/* Eviction, then a refault of the same range over the shadows. */
+		EXPECT(!insert(FAR, order, &big));
+		EXPECT(!store_order(FAR, order, SHADOW));
+		EXPECT(holds(FAR, nr, SHADOW) == nr);
+		far_counted(nr);
+		cc_xas_store_expected(&xas, SHADOW, &other);
+		EXPECT(!cc_xas_error(&xas));
+		cc_xas_clear_xa_node(&xas);
+		EXPECT(holds(FAR, nr, &other) == nr);
+		far_counted(nr);
+		EXPECT(!erase(FAR, order));
+		EXPECT(holds(FAR, nr, NULL) == nr);
+		end();
+	}
+}
+
+static unsigned int walk_marked(unsigned long start, void **seen)
+{
+	CC_XA_STATE(xas, XA, start);
+	unsigned int n = 0;
+	void *entry;
+
+	cc_xas_for_each_marked(&xas, entry, ULONG_MAX, CC_XA_MARK_0) {
+		if (n == 8)
+			break;
+		seen[n++] = entry;
+	}
+	cc_xas_clear_xa_node(&xas);
+	return n;
+}
+
+static void mark(unsigned long index, bool set)
+{
+	CC_XA_STATE(xas, XA, index);
+
+	cc_xas_load(&xas, true);
+	if (set)
+		cc_xas_set_mark(&xas, CC_XA_MARK_0);
+	else
+		cc_xas_clear_mark(&xas, CC_XA_MARK_0);
+	cc_xas_clear_xa_node(&xas);
+}
+
+static bool marked(unsigned long index)
+{
+	CC_XA_STATE(xas, XA, index);
+	bool ret;
+
+	cc_xas_load(&xas, true);
+	ret = cc_xas_get_mark(&xas, CC_XA_MARK_0);
+	cc_xas_clear_xa_node(&xas);
+	return ret;
+}
+
+/*
+ * A store of several leaves fails for memory only before it has changed a
+ * slot, as upstream xas_store() does: its leaves are created first.
+ */
+static void far_nomem(void)
+{
+	unsigned int nomem = 0;
+
+	/* The first leaf exists, the second one does not. */
+	begin("far-nomem value");
+	EXPECT(!insert(FAR + 5, 0, &other));
+	EXPECT(!erase(FAR + 5, 0));
+	{
+		CC_XA_STATE_ORDER(xas, XA, FAR, FAR_ORDER);
+
+		for (;;) {
+			cc_xas_store(&xas, SHADOW);
+			if (!cc_xas_error(&xas))
+				break;
+			nomem++;
+			EXPECT(cc_xas_error(&xas) == -ENOMEM);
+			EXPECT(holds(FAR, FAR_NR, NULL) == FAR_NR);
+			if (!cc_xas_nomem(&xas, GFP_KERNEL))
+				break;
+		}
+		EXPECT(!cc_xas_error(&xas));
+		cc_xas_clear_xa_node(&xas);
+	}
+	EXPECT(nomem);
+	EXPECT(holds(FAR, FAR_NR, SHADOW) == FAR_NR);
+	far_counted(FAR_NR);
+	end();
+
+	/* A refault over a shadow: the retry still finds the shadow. */
+	begin("far-nomem refault");
+	EXPECT(!insert(FAR, 0, SHADOW));
+	nomem = 0;
+	{
+		CC_XA_STATE_ORDER(xas, XA, FAR, FAR_ORDER);
+
+		for (;;) {
+			cc_xas_store_expected(&xas, SHADOW, &big);
+			if (!cc_xas_error(&xas))
+				break;
+			nomem++;
+			EXPECT(cc_xa_load(XA, FAR) == SHADOW);
+			if (!cc_xas_nomem(&xas, GFP_KERNEL))
+				break;
+		}
+		EXPECT(!cc_xas_error(&xas));
+		cc_xas_clear_xa_node(&xas);
+	}
+	EXPECT(nomem);
+	EXPECT(holds(FAR, FAR_NR, &big) == FAR_NR);
+	far_counted(FAR_NR);
+	end();
+
+	/* A value that cannot take a later leaf leaves the earlier one. */
+	begin("far-refused value");
+	EXPECT(!insert(FAR + 100, 0, &other));
+	{
+		CC_XA_STATE_ORDER(xas, XA, FAR, FAR_ORDER);
+
+		do {
+			cc_xas_store_expected(&xas, NULL, SHADOW);
+		} while (cc_xas_nomem(&xas, GFP_KERNEL));
+		EXPECT(cc_xas_error(&xas) == -EEXIST);
+		cc_xas_clear_xa_node(&xas);
+	}
+	EXPECT(holds(FAR, FAR_NR, NULL) == FAR_NR - 1);
+	EXPECT(cc_xa_load(XA, FAR + 100) == &other);
+	far_counted(FAR_NR);
+	end();
+}
+
+static int small[NR];
+
+/*
+ * cc_xas_store() of NULL clears the range of the state whatever it holds, as
+ * xas_store() does.  cc_xas_store_expected() names one entry and removes that
+ * entry alone.  The state keeps its range for the next operation.
+ */
+static void delete_range(void)
+{
+	struct cc_xa_node *node = begin("delete-range");
+	void *seen[8];
+	unsigned long i;
+
+	for (i = 0; i < NR; i++)
+		EXPECT(!insert(BASE + i, 0, &small[i]));
+	EXPECT(!erase(BASE, ORDER));
+	EXPECT(holds(BASE, NR, NULL) == NR);
+	counted(node);
+
+	/* Values are one entry per index. */
+	EXPECT(!insert(BASE, ORDER, SHADOW));
+	EXPECT(!erase(BASE, ORDER));
+	EXPECT(holds(BASE, NR, NULL) == NR);
+	counted(node);
+
+	/* A state smaller than the entry removes all of the entry. */
+	EXPECT(!insert(BASE, ORDER, &big));
+	EXPECT(!erase(BASE, 1));
+	EXPECT(holds(BASE, NR, NULL) == NR);
+
+	/* An entry that begins after the range stays. */
+	EXPECT(!insert(BASE, 0, &other));
+	EXPECT(!insert(BASE + 2, 1, &big));
+	EXPECT(!erase(BASE, 1));
+	EXPECT(holds(BASE, 2, NULL) == 2 && holds(BASE + 2, 2, &big) == 2);
+	EXPECT(!erase(BASE + 2, 1));
+	counted(node);
+
+	/* The delete that names its entry. */
+	for (i = 0; i < NR; i++)
+		EXPECT(!insert(BASE + i, 0, &small[i]));
+	{
+		CC_XA_STATE_ORDER(xas, XA, BASE, ORDER);
+
+		cc_xas_store_expected(&xas, &small[0], NULL);
+		EXPECT(!cc_xas_error(&xas));
+		cc_xas_clear_xa_node(&xas);
+	}
+	EXPECT(!cc_xa_load(XA, BASE));
+	for (i = 1; i < NR; i++)
+		EXPECT(cc_xa_load(XA, BASE + i) == &small[i]);
+	counted(node);
+	end();
+
+	begin("delete-range far");
+	EXPECT(!insert(FAR + 5, 0, &small[0]));
+	EXPECT(!insert(FAR + 70, 0, SHADOW));
+	EXPECT(!insert(FAR + 127, 0, &small[1]));
+	EXPECT(!insert(FAR + FAR_NR, 0, &other));
+	EXPECT(!erase(FAR, FAR_ORDER));
+	EXPECT(holds(FAR, FAR_NR, NULL) == FAR_NR);
+	EXPECT(cc_xa_load(XA, FAR + FAR_NR) == &other);
+	far_counted(FAR_NR);
+
+	/*
+	 * page_cache_delete() stores the shadow and clears the marks through
+	 * the same state.  The state still names the range afterwards.
+	 */
+	EXPECT(!insert(FAR, FAR_ORDER, &big));
+	mark(FAR, true);
+	{
+		CC_XA_STATE_ORDER(xas, XA, FAR, FAR_ORDER);
+
+		cc_xas_store(&xas, SHADOW);
+		EXPECT(!cc_xas_error(&xas));
+		cc_xas_init_marks(&xas);
+		EXPECT(holds(FAR, FAR_NR, SHADOW) == FAR_NR);
+		EXPECT(!walk_marked(0, seen));
+		cc_xas_store(&xas, NULL);
+		EXPECT(!cc_xas_error(&xas));
+		cc_xas_clear_xa_node(&xas);
+	}
+	EXPECT(holds(FAR, FAR_NR, NULL) == FAR_NR);
+	far_counted(FAR_NR);
+
+	/* The same after a store of a pointer entry. */
+	{
+		CC_XA_STATE_ORDER(xas, XA, FAR, FAR_ORDER);
+
+		do {
+			cc_xas_store_expected(&xas, NULL, &big);
+		} while (cc_xas_nomem(&xas, GFP_KERNEL));
+		EXPECT(!cc_xas_error(&xas));
+		cc_xas_store(&xas, NULL);
+		EXPECT(!cc_xas_error(&xas));
+		cc_xas_clear_xa_node(&xas);
+	}
+	EXPECT(holds(FAR, FAR_NR, NULL) == FAR_NR);
+	far_counted(FAR_NR);
+	end();
+}
+
+static void far_other(void)
+{
+	unsigned long i, bigs = holds(FAR, FAR_NR, &big);
+
+	nr_partial += bigs && bigs < FAR_NR;
+	other_err = insert(other_index, 0, &other);
+	for (i = 0; i < FAR_NR; i++) {
+		if (FAR + i != other_index && peek(FAR + i) == &other)
+			wrong_index = true;
+	}
+}
+
+static void far_settled(bool big_present)
+{
+	unsigned long want = FAR_NR - (other_err ? 0 : 1);
+
+	EXPECT(other_err == 0 || other_err == -EEXIST);
+	EXPECT(!wrong_index);
+	EXPECT(!(big_present && !other_err));
+	EXPECT(holds(FAR, FAR_NR, big_present ? &big : NULL) == want);
+	if (!other_err)
+		EXPECT(cc_xa_load(XA, other_index) == &other);
+	far_counted(FAR_NR);
+}
+
+/* Every slot write of an order-7 store or delete, against one insert. */
+static void far_meets_insert(bool deleting)
+{
+	static const unsigned long at[] = { 0, 1, 63, 64, 100, 127 };
+	unsigned int write, a;
+	bool ran = true;
+
+	for (write = 0; ran; write++) {
+		for (a = 0; a < ARRAY_SIZE(at); a++) {
+			int err;
+
+			cc_xa_init(XA);
+			if (insert(1, 0, &anchor))
+				abort();
+			if (deleting && insert(FAR, FAR_ORDER, &big))
+				abort();
+			other_index = FAR + at[a];
+			other_err = 1;
+			wrong_index = false;
+			countdown = write;
+			watch_all = true;
+			intruder = far_other;
+			err = deleting ? erase(FAR, FAR_ORDER) :
+					 insert(FAR, FAR_ORDER, &big);
+			watch_all = false;
+			ran = fired();
+			if (!ran)
+				other_err = -EEXIST;
+			if (deleting)
+				EXPECT(!err);
+			else
+				EXPECT(err == 0 || err == -EEXIST);
+			far_settled(!deleting && !err);
+			if (failures) {
+				printf("  %s write=%u insert=%lu: error %d, insert error %d\n",
+				       deleting ? "delete" : "store", write,
+				       other_index, err, other_err);
+				end();
+				return;
+			}
+			end();
+		}
+	}
+	printf("  %u slot writes\n", write - 1);
+}
+
+static void far_store_meets_insert(void)
+{
+	far_meets_insert(false);
+}
+
+static void far_delete_meets_insert(void)
+{
+	far_meets_insert(true);
+}
+
 /*
  * Threads instead of a schedule.  One writer inserts and deletes the order-2
  * entry, one writer per index does the same with an order-0 entry of its own,
@@ -259,6 +884,176 @@ struct worker {
 	unsigned long index;
 	unsigned long done, lost, loads;
 };
+
+static void *shadow_writer(void *arg)
+{
+	struct worker *w = arg;
+
+	rcu_register_thread();
+	while (w->done + w->lost < attempts) {
+		CC_XA_STATE_ORDER(xas, XA, BASE, ORDER);
+		int err;
+
+		BREATHE(w->done + w->lost);
+		if (insert(BASE, ORDER, &big)) {
+			w->lost++;
+			continue;
+		}
+		/*
+		 * Eviction: the folio becomes a shadow of the same range in
+		 * one step.  A multi-index shadow never arrives slot by slot.
+		 */
+		cc_xas_store(&xas, SHADOW);
+		if (cc_xas_error(&xas))
+			abort();
+		cc_xas_clear_xa_node(&xas);
+		cc_xas_set_order(&xas, BASE, ORDER);
+		cc_xas_store_expected(&xas, SHADOW, NULL);
+		err = cc_xas_error(&xas);
+		cc_xas_clear_xa_node(&xas);
+		if (err && err != -EEXIST)
+			abort();
+		w->done++;
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *splitting_writer(void *arg)
+{
+	struct worker *w = arg;
+	unsigned long index = BASE + w->index;
+
+	rcu_register_thread();
+	while (!stop) {
+		int err;
+
+		BREATHE(w->done + w->lost);
+		err = split();
+		if (err && err != -EEXIST)
+			abort();
+		if (replace_shadow(index, &small[w->index]) &&
+		    insert(index, 0, &small[w->index])) {
+			w->lost++;
+			continue;
+		}
+		if (erase(index, 0))
+			abort();
+		w->done++;
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *big_writer(void *arg)
+{
+	struct worker *w = arg;
+
+	rcu_register_thread();
+	while (w->done + w->lost < attempts) {
+		BREATHE(w->done + w->lost);
+		if (insert(BASE, ORDER, &big)) {
+			w->lost++;
+			continue;
+		}
+		if (erase(BASE, ORDER))
+			abort();
+		w->done++;
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *small_writer(void *arg)
+{
+	struct worker *w = arg;
+
+	rcu_register_thread();
+	while (!stop) {
+		BREATHE(w->done + w->lost);
+		if (insert(BASE + w->index, 0, &small[w->index])) {
+			w->lost++;
+			continue;
+		}
+		if (erase(BASE + w->index, 0))
+			abort();
+		w->done++;
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *reader(void *arg)
+{
+	struct worker *w = arg;
+	unsigned long i;
+
+	rcu_register_thread();
+	while (!stop) {
+		BREATHE(w->loads >> 2);
+		for (i = 0; i < NR; i++) {
+			void *entry = peek(BASE + i);
+
+			w->loads++;
+			if (entry && entry != &big && entry != SHADOW &&
+			    entry != &small[i])
+				__sync_fetch_and_add(&stress_wrong, 1);
+		}
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void stress(unsigned long nr, bool shadow)
+{
+	struct cc_xa_node *node = begin(shadow ? "stress-split" : "stress");
+	struct worker big_w = { 0 }, small_w[NR] = { { 0 } }, read_w[2] = { { 0 } };
+	unsigned long i, small_done = 0, small_lost = 0, loads = 0;
+
+	other_err = -EEXIST;
+	wrong_index = false;
+	attempts = nr;
+	pthread_create(&big_w.thread, NULL,
+		       shadow ? shadow_writer : big_writer, &big_w);
+	for (i = 0; i < NR; i++) {
+		small_w[i].index = i;
+		pthread_create(&small_w[i].thread, NULL,
+			       shadow ? splitting_writer : small_writer,
+			       &small_w[i]);
+	}
+	for (i = 0; i < 2; i++)
+		pthread_create(&read_w[i].thread, NULL, reader, &read_w[i]);
+	pthread_join(big_w.thread, NULL);
+	stop = true;
+	for (i = 0; i < NR; i++) {
+		pthread_join(small_w[i].thread, NULL);
+		small_done += small_w[i].done;
+		small_lost += small_w[i].lost;
+	}
+	for (i = 0; i < 2; i++) {
+		pthread_join(read_w[i].thread, NULL);
+		loads += read_w[i].loads;
+	}
+	show("at rest", node);
+	printf("  order-2 stored %lu, refused %lu\n", big_w.done, big_w.lost);
+	printf("  order-0 stored %lu, refused %lu\n", small_done, small_lost);
+	printf("  lookups %lu, wrong entry %lu\n", loads, stress_wrong);
+	EXPECT(!stress_wrong);
+	EXPECT(big_w.done && small_done);
+	if (shadow) {
+		/* A shadow split off before its delete may stay behind. */
+		show_split("at rest", node);
+		for (i = 0; i < NR; i++) {
+			void *entry = cc_xa_load(XA, BASE + i);
+
+			EXPECT(!entry || entry == SHADOW);
+		}
+		counted(node);
+	} else {
+		settled(node, false);
+	}
+	end();
+}
 
 /*
  * "stress-far [attempts]": the same with an order-7 entry, which fills two
@@ -453,6 +1248,15 @@ int main(int argc, char **argv)
 		const char *name;
 		void (*run)(void);
 	} cases[] = {
+		{ "alone", alone },
+		{ "store-meets-insert", store_meets_insert },
+		{ "delete-meets-insert", delete_meets_insert },
+		{ "evict-meets-insert", evict_meets_insert },
+		{ "far-alone", far_alone },
+		{ "far-store-meets-insert", far_store_meets_insert },
+		{ "far-delete-meets-insert", far_delete_meets_insert },
+		{ "far-nomem", far_nomem },
+		{ "delete-range", delete_range },
 	};
 	unsigned int i, failed = 0;
 
@@ -462,6 +1266,13 @@ int main(int argc, char **argv)
 			 !strcmp(argv[1], "stress-nodes"))) {
 		stress_far(argc > 2 ? strtoul(argv[2], NULL, 0) : 200000,
 			   !strcmp(argv[1], "stress-nodes"));
+		printf("%s %s\n", failures ? "FAIL" : "PASS", argv[1]);
+		rcu_unregister_thread();
+		return !!failures;
+	}
+	if (argc > 1 && !strncmp(argv[1], "stress", 6)) {
+		stress(argc > 2 ? strtoul(argv[2], NULL, 0) : 2000000,
+		       !strcmp(argv[1], "stress-split"));
 		printf("%s %s\n", failures ? "FAIL" : "PASS", argv[1]);
 		rcu_unregister_thread();
 		return !!failures;
