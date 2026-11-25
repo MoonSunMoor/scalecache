@@ -4867,7 +4867,7 @@ static void filemap_cachestat(struct address_space *mapping,
 	struct folio *folio;
 
 	if (cc_xas_is_ccxarray(&xas)) {
-		filemap_cachestat(mapping, first_index, last_index, cs);
+		cc_filemap_cachestat(mapping, first_index, last_index, cs);
 		return;
 	}
 
