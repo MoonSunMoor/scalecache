@@ -2399,6 +2399,7 @@ void cc_tag_pages_for_writeback(struct address_space *mapping,
 		cc_xas_lock_irq(&xas);
 	}
 	cc_xas_unlock_irq(&xas);
+	cc_xas_clear_xa_node(&xas);
 }
 EXPORT_SYMBOL(cc_tag_pages_for_writeback);
 

@@ -792,10 +792,12 @@ static int __cc_folio_migrate_mapping(struct address_space *mapping,
 		folio_set_dirty(newfolio);
 	}
 
-	if (folio_test_swapcache(folio))
+	if (folio_test_swapcache(folio)) {
 		__swap_cache_replace_folio(ci, folio, newfolio);
-	else
+	} else {
 		cc_xas_store(&xas, newfolio);
+		cc_xas_clear_xa_node(&xas);
+	}
 
 	/*
 	 * Drop cache reference from old folio by unfreezing
