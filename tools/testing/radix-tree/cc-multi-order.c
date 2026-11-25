@@ -1123,6 +1123,58 @@ static void far_nomem(void)
 	end();
 }
 
+/* What the conflict scan of a range of two leaves returns. */
+static unsigned int conflicts(void **seen)
+{
+	CC_XA_STATE_ORDER(xas, XA, FAR, FAR_ORDER);
+	unsigned int n = 0;
+	void *entry;
+
+	cc_xas_for_each_conflict(&xas, entry) {
+		if (n == 8)
+			break;
+		seen[n++] = entry;
+	}
+	cc_xas_clear_xa_node(&xas);
+	return n;
+}
+
+/*
+ * The scan that __filemap_add_folio() makes before it stores a folio looks
+ * at every leaf of the range, whatever state the first one is in.
+ */
+static void far_conflict(void)
+{
+	void *seen[8];
+
+	/* The first leaf was never there. */
+	begin("far-conflict no leaf");
+	EXPECT(!insert(FAR + 70, 0, SHADOW));
+	EXPECT(conflicts(seen) == 1 && seen[0] == SHADOW);
+	end();
+
+	/* The first leaf is deleted. */
+	begin("far-conflict deleted leaf");
+	EXPECT(!insert(FAR + 5, 0, &other));
+	EXPECT(!erase(FAR + 5, 0));
+	EXPECT(!conflicts(seen));
+	EXPECT(!insert(FAR + 70, 0, SHADOW));
+	EXPECT(!insert(FAR + 127, 0, &other));
+	EXPECT(conflicts(seen) == 2 && seen[0] == SHADOW && seen[1] == &other);
+	far_counted(FAR_NR);
+
+	/* The first leaf holds an entry. */
+	EXPECT(!insert(FAR + 5, 0, &big));
+	EXPECT(conflicts(seen) == 3 && seen[0] == &big && seen[1] == SHADOW &&
+	       seen[2] == &other);
+	/* Nothing beyond the range. */
+	EXPECT(!erase(FAR + 5, 0) && !erase(FAR + 70, 0) && !erase(FAR + 127, 0));
+	EXPECT(!insert(FAR + FAR_NR, 0, &other));
+	EXPECT(!conflicts(seen));
+	far_counted(FAR_NR);
+	end();
+}
+
 static int small[NR];
 
 /*
@@ -1712,6 +1764,7 @@ int main(int argc, char **argv)
 		{ "far-store-meets-insert", far_store_meets_insert },
 		{ "far-delete-meets-insert", far_delete_meets_insert },
 		{ "far-nomem", far_nomem },
+		{ "far-conflict", far_conflict },
 		{ "delete-range", delete_range },
 	};
 	unsigned int i, failed = 0;

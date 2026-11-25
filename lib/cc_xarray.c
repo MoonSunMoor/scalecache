@@ -2576,9 +2576,19 @@ void *cc_xas_find_conflict(struct cc_xa_state *xas)
 			while (__atomic_load_n(&node->gc_flag, __ATOMIC_SEQ_CST))
 				cpu_relax();
 			if (__atomic_load_n(&node->del, __ATOMIC_SEQ_CST)) {
-				/* @node logically deleted! returning NULL */
-				cc_xas_rewind_refcnt(xas);
-				return NULL;
+				if (node->shift >= xas->xa_shift) {
+					/* @node logically deleted! returning NULL */
+					cc_xas_rewind_refcnt(xas);
+					return NULL;
+				}
+				/*
+				 * A deleted leaf of a range of several leaves
+				 * holds nothing; the leaves after it may.
+				 */
+				cc_xas_set_xa_node(xas, node);
+				xas->xa_offset = CC_XA_CHUNK_MASK;
+				curr = NULL;
+				break;
 			}
 			curr = cc_xas_descend(xas, node);
 			//cc_xa_put_node(node);

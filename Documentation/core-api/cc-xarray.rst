@@ -249,6 +249,9 @@ deletes, and must not add compensation code:
   does.  The leaves of an entry of several leaves are created before the
   first slot is written, so the retry after ``cc_xas_nomem()`` finds the
   range as the caller saw it.
+* ``cc_xas_find_conflict()`` and ``cc_xas_for_each_conflict()`` look at every
+  leaf of a range of several leaves, whether the first leaf exists, is
+  logically deleted or holds entries.
 * A successful store or delete covers the whole range.  ``cc_xas_store()``
   of ``NULL`` clears every slot of the range of the state, whatever it holds,
   and the rest of an entry that begins in the range, as ``xas_store()`` does.
