@@ -2713,8 +2713,12 @@ void __folio_mark_dirty(struct folio *folio, struct address_space *mapping,
 	if (folio->mapping) {	/* Race with truncate? */
 		WARN_ON_ONCE(warn && !folio_test_uptodate(folio));
 		folio_account_dirtied(folio, mapping);
-		__xa_set_mark(&mapping->i_pages, folio->index,
-			      PAGECACHE_TAG_DIRTY);
+		if (cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages)))
+			__cc_xa_set_mark(CC_XARRAY(&mapping->i_pages),
+					 folio->index, PAGECACHE_TAG_DIRTY);
+		else
+			__xa_set_mark(&mapping->i_pages, folio->index,
+				      PAGECACHE_TAG_DIRTY);
 	}
 	xa_unlock_irqrestore(&mapping->i_pages, flags);
 }
@@ -2995,7 +2999,11 @@ bool __folio_end_writeback(struct folio *folio)
 
 		xa_lock_irqsave(&mapping->i_pages, flags);
 		ret = folio_xor_flags_has_waiters(folio, 1 << PG_writeback);
-		__xa_clear_mark(&mapping->i_pages, folio->index,
+		if (cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages)))
+			__cc_xa_clear_mark(CC_XARRAY(&mapping->i_pages),
+					   folio->index, PAGECACHE_TAG_WRITEBACK);
+		else
+			__xa_clear_mark(&mapping->i_pages, folio->index,
 					PAGECACHE_TAG_WRITEBACK);
 
 		wb = inode_to_wb(inode);
