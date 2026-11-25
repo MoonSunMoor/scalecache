@@ -11,14 +11,22 @@ port from Linux 6.6.8 to 7.2.8.  It complements
 The implementation is in ``include/linux/cc_xarray.h`` and
 ``lib/cc_xarray.c``.
 
-This first-stage port targets order-0 page-cache operation.  Keep large
-folios disabled for CC mappings through the page-cache allocation policy,
+The page-cache callers of this port are converted for order-0 operation
+first.  The tree stores, deletes, walks and splits entries of any order as
+"Order and split interfaces" states, but a CC mapping may only get large
+folios once every caller of that mapping follows that section.  Until then
+keep them off by leaving the maximum folio order of the mapping at zero,
 not by disabling ``CONFIG_TRANSPARENT_HUGEPAGE`` or ``CONFIG_XARRAY_MULTI``.
-Do not use DAX on CC mappings either: DAX stores multi-order entries with
-ordinary XArray operations.  Both stay disabled until the multi-index
-requirements in "Order and split interfaces" are met.
-The presence of split APIs is not a guarantee of concurrent large-folio
-support.  Direct flush (dflush) is separate from these tree interfaces.
+A filesystem turns large folios on for its CC mappings by setting a maximum
+order above zero.  It needs no limit of its own:
+``mapping_max_folio_order()`` limits a CC mapping to
+``MAX_CC_PAGECACHE_ORDER``, one below PMD order, whatever range the
+filesystem sets.  khugepaged and PMD mappings use ordinary XArray operations
+and ``mapping_pmd_folio_support()`` keeps them away below PMD order.  A
+minimum order above that limit is not supported.
+Do not use DAX on CC mappings: DAX stores multi-order entries with ordinary
+XArray operations.  Direct flush (dflush) is separate from these tree
+interfaces.
 
 Design constraints from the paper
 =================================
