@@ -159,6 +159,30 @@ static void page_cache_delete(struct address_space *mapping,
 	spin_unlock_irqrestore(&mapping->nr_lock, flags);
 }
 
+/*
+ * Store @entry over the slot of @folio, which the caller owns: the folio is
+ * locked, or frozen, and stays in the page cache until this store.  The
+ * store can still lose its slot CAS when the folio sits directly in the
+ * tree head and another thread publishes a root node over it.  The folio
+ * then lives in slot 0 of the new root; store again from the root.
+ */
+static void cc_page_cache_store(struct cc_xa_state *xas, struct folio *folio,
+				void *entry)
+{
+	for (;;) {
+		int error;
+
+		cc_xas_store(xas, entry);
+		error = cc_xas_error(xas);
+		if (likely(!error))
+			return;
+
+		BUG_ON(error != -EEXIST);
+		BUG_ON(cc_xa_load(xas->xa, xas->xa_index) != folio);
+		cc_xas_reset(xas);
+	}
+}
+
 static void cc_page_cache_delete(struct address_space *mapping,
 				   struct folio *folio, void *shadow)
 {
@@ -174,7 +198,7 @@ static void cc_page_cache_delete(struct address_space *mapping,
 
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
 
-	cc_xas_store(&xas, shadow);
+	cc_page_cache_store(&xas, folio, shadow);
 	cc_xas_init_marks(&xas);
 	cc_xas_clear_xa_node(&xas);
 
@@ -404,7 +428,7 @@ static void cc_page_cache_delete_batch(struct address_space *mapping,
 		/* Leave folio->index set: truncation lookup relies on it */
 
 		i++;
-		cc_xas_store(&xas, NULL);
+		cc_page_cache_store(&xas, folio, NULL);
 		total_pages += folio_nr_pages(folio);
 	}
 	cc_xas_clear_xa_node(&xas);
@@ -973,7 +997,7 @@ static void cc_replace_page_cache_folio(struct folio *old, struct folio *new)
 
 	local_irq_disable();
 	preempt_disable();
-	cc_xas_store(&xas, new);
+	cc_page_cache_store(&xas, old, new);
 	cc_xas_clear_xa_node(&xas);
 
 	old->mapping = NULL;
