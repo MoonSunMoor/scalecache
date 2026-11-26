@@ -326,6 +326,11 @@ static void page_cache_delete_batch(struct address_space *mapping,
 	struct folio *folio;
 	unsigned long flags;
 
+	if (cc_xas_is_ccxarray(&xas)) {
+		cc_page_cache_delete_batch(mapping, fbatch);
+		return;
+	}
+
 	mapping_set_update(&xas, mapping);
 	xas_for_each(&xas, folio, ULONG_MAX) {
 		if (i >= folio_batch_count(fbatch))
