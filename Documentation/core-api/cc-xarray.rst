@@ -152,7 +152,9 @@ use it, passing the entry collected by its ``cc_xas_for_each_conflict()``
 scan.  This is the one intended difference from the original insertion
 code.  Paths that store over an entry they own, such as a locked folio
 whose references are frozen during deletion, replacement or migration,
-keep ``cc_xas_store()``.  Only the canonical slot is compared.
+keep ``cc_xas_store()``; the one way such a store can still fail is
+described after the error list below.  Only the canonical slot is
+compared.
 
 ``cc_xa_store()`` and its locked wrapper instead return an encoded error
 on failure; decode it with ``cc_xa_err()``.  Do not decode an advanced
@@ -174,6 +176,17 @@ For store/try-split callers, distinguish:
   observed shadow.  Return to the caller's existing conflict path, which
   looks the index up again.  Do not add an unconditional retry loop or
   translate it into ``-EAGAIN`` or a new ``-EBUSY`` convention.
+
+Stores over an owned entry have no conflict path to return to.  The
+owner's slot can change in one way only: when the owned entry sits
+directly in the tree head (a single entry at index zero), an insertion at
+another index can publish a root node that moves the entry into slot 0.
+The owner's head CAS then fails with ``-EEXIST``.  Check that the owned
+entry is still at its index and store again from the root, as
+``cc_page_cache_store()`` in ``mm/filemap.c`` does; the retry ends once
+the root is published.  Treat any other error, or a different entry at
+the index, as a broken invariant.  This applies to page-cache deletion
+and replacement (#4, #5) and to migration (#14).
 
 This is not a closed errno list for every CC API.  For example,
 ``__cc_xa_insert()`` retains ``-EBUSY`` for an already occupied entry.
