@@ -176,6 +176,7 @@ static void cc_page_cache_delete(struct address_space *mapping,
 
 	cc_xas_store(&xas, shadow);
 	cc_xas_init_marks(&xas);
+	cc_xas_clear_xa_node(&xas);
 
 	folio->mapping = NULL;
 	/* Leave folio->index set: truncation lookup relies upon it */
@@ -968,6 +969,7 @@ static void cc_replace_page_cache_folio(struct folio *old, struct folio *new)
 	local_irq_disable();
 	preempt_disable();
 	cc_xas_store(&xas, new);
+	cc_xas_clear_xa_node(&xas);
 
 	old->mapping = NULL;
 	/* hugetlb pages do not participate in page cache accounting. */
@@ -1111,6 +1113,7 @@ static int __cc_filemap_add_folio(struct address_space *mapping,
 	long nr;
 	unsigned int forder = folio_order(folio);
 	unsigned long flags;
+	int error;
 
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
 	VM_BUG_ON_FOLIO(folio_test_swapbacked(folio), folio);
@@ -1204,7 +1207,9 @@ unlock:
 		cc_xas_set_order(&xas, index, forder);
 	}
 
-	if (cc_xas_error(&xas))
+	error = cc_xas_error(&xas);
+	cc_xas_clear_xa_node(&xas);
+	if (error)
 		goto error;
 
 	trace_mm_filemap_add_to_page_cache(folio);
@@ -1213,7 +1218,7 @@ error:
 	folio->mapping = NULL;
 	/* Leave folio->index set: truncation relies upon it */
 	folio_put_refs(folio, nr);
-	return cc_xas_error(&xas);
+	return error;
 }
 
 int filemap_add_folio(struct address_space *mapping, struct folio *folio,
