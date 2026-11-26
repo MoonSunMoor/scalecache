@@ -2015,7 +2015,7 @@ static void *cc_filemap_get_entry(struct address_space *mapping, pgoff_t index)
 	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), index);
 	struct folio *folio;
 
-	// rcu_read_lock();
+	rcu_read_lock();
 repeat:
 	cc_xas_reset(&xas);
 	folio = cc_xas_load(&xas, true);
@@ -2036,7 +2036,7 @@ repeat:
 		goto repeat;
 	}
 out:
-	//rcu_read_unlock();
+	rcu_read_unlock();
 	cc_xas_clear_xa_node(&xas);
 
 	return folio;
@@ -2322,7 +2322,7 @@ static unsigned cc_find_get_entries(struct address_space *mapping, pgoff_t *star
 	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), *start);
 	struct folio *folio;
 
-	// rcu_read_lock();
+	rcu_read_lock();
 	while ((folio = cc_find_get_entry(&xas, end, CC_XA_PRESENT)) != NULL) {
 		indices[fbatch->nr] = xas.xa_index;
 		if (!folio_batch_add(fbatch, folio))
@@ -2340,7 +2340,7 @@ static unsigned cc_find_get_entries(struct address_space *mapping, pgoff_t *star
 			nr = 1 << cc_xa_get_order(CC_XARRAY(&mapping->i_pages), indices[idx]);
 		*start = round_down(indices[idx] + nr, nr);
 	}
-	// rcu_read_unlock();
+	rcu_read_unlock();
 
 	return folio_batch_count(fbatch);
 }
@@ -2431,7 +2431,7 @@ static unsigned cc_find_lock_entries(struct address_space *mapping, pgoff_t *sta
 	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), *start);
 	struct folio *folio;
 
-	// rcu_read_lock();
+	rcu_read_lock();
 	while ((folio = cc_find_get_entry(&xas, end, CC_XA_PRESENT))) {
 		unsigned long base;
 		unsigned long nr;
@@ -2474,7 +2474,7 @@ unlock:
 put:
 		folio_put(folio);
 	}
-	// rcu_read_unlock();
+	rcu_read_unlock();
 	cc_xas_clear_xa_node(&xas);
 
 	return folio_batch_count(fbatch);
@@ -2585,7 +2585,7 @@ static unsigned cc_filemap_get_folios_contig(struct address_space *mapping,
 	unsigned long nr;
 	struct folio *folio;
 
-	// rcu_read_lock();
+	rcu_read_lock();
 
 	for (folio = cc_xas_load(&xas, true); folio && xas.xa_index <= end;
 			folio = cc_xas_next(&xas)) {
@@ -2629,7 +2629,7 @@ update_start:
 		*start = folio_next_index(folio);
 	}
 out:
-	// rcu_read_unlock();
+	rcu_read_unlock();
 	cc_xas_clear_xa_node(&xas);
 	return folio_batch_count(fbatch);
 }
@@ -2702,7 +2702,7 @@ static unsigned cc_filemap_get_folios_tag(struct address_space *mapping, pgoff_t
 	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), *start);
 	struct folio *folio;
 
-	// rcu_read_lock();
+	rcu_read_lock();
 	while ((folio = cc_find_get_entry(&xas, end, (__force cc_xa_mark_t)tag)) != NULL) {
 		/*
 		 * Shadow entries should never be tagged, but this iteration
@@ -2727,7 +2727,7 @@ static unsigned cc_filemap_get_folios_tag(struct address_space *mapping, pgoff_t
 	else
 		*start = end + 1;
 out:
-	// rcu_read_unlock();
+	rcu_read_unlock();
 	cc_xas_clear_xa_node(&xas);
 
 	return folio_batch_count(fbatch);
@@ -3671,7 +3671,7 @@ static loff_t cc_mapping_seek_hole_data(struct address_space *mapping, loff_t st
 	if (end <= start)
 		return -ENXIO;
 
-	// rcu_read_lock();
+	rcu_read_lock();
 	while ((folio = cc_find_get_entry(&xas, max, CC_XA_PRESENT))) {
 		loff_t pos = (u64)xas.xa_index << PAGE_SHIFT;
 		size_t seek_size;
@@ -3698,7 +3698,7 @@ static loff_t cc_mapping_seek_hole_data(struct address_space *mapping, loff_t st
 	if (seek_data)
 		start = -ENXIO;
 unlock:
-	// rcu_read_unlock();
+	rcu_read_unlock();
 	cc_xas_clear_xa_node(&xas);
 	if (folio && !cc_xa_is_value(folio))
 		folio_put(folio);
