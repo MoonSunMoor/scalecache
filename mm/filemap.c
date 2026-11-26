@@ -2341,6 +2341,7 @@ static unsigned cc_find_get_entries(struct address_space *mapping, pgoff_t *star
 		*start = round_down(indices[idx] + nr, nr);
 	}
 	rcu_read_unlock();
+	cc_xas_clear_xa_node(&xas);
 
 	return folio_batch_count(fbatch);
 }
