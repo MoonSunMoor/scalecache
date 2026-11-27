@@ -719,6 +719,29 @@ static int __folio_migrate_mapping(struct address_space *mapping,
 	return 0;
 }
 
+/*
+ * Store @entry over the slot of @folio, which the caller has frozen.  The
+ * store can still lose its slot CAS when the folio sits directly in the
+ * tree head and another thread publishes a root node over it.  The folio
+ * then lives in slot 0 of the new root; store again from the root.
+ */
+static void cc_migrate_store(struct cc_xa_state *xas, struct folio *folio,
+			     void *entry)
+{
+	for (;;) {
+		int error;
+
+		cc_xas_store(xas, entry);
+		error = cc_xas_error(xas);
+		if (likely(!error))
+			return;
+
+		BUG_ON(error != -EEXIST);
+		BUG_ON(cc_xa_load(xas->xa, xas->xa_index) != folio);
+		cc_xas_reset(xas);
+	}
+}
+
 static int __cc_folio_migrate_mapping(struct address_space *mapping,
 		struct folio *newfolio, struct folio *folio, int expected_count)
 {
@@ -795,7 +818,7 @@ static int __cc_folio_migrate_mapping(struct address_space *mapping,
 	if (folio_test_swapcache(folio)) {
 		__swap_cache_replace_folio(ci, folio, newfolio);
 	} else {
-		cc_xas_store(&xas, newfolio);
+		cc_migrate_store(&xas, folio, newfolio);
 		cc_xas_clear_xa_node(&xas);
 	}
 
@@ -940,7 +963,7 @@ static int cc_migrate_huge_page_move_mapping(struct address_space *mapping,
 
 	folio_ref_add(dst, folio_nr_pages(dst));
 
-	cc_xas_store(&xas, dst);
+	cc_migrate_store(&xas, src, dst);
 	cc_xas_clear_xa_node(&xas);
 
 	folio_ref_unfreeze(src, expected_count - folio_nr_pages(src));
