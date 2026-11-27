@@ -671,12 +671,17 @@ static pageout_t pageout(struct folio *folio, struct address_space *mapping,
  * Same as remove_mapping, but if the folio is removed from the mapping, it
  * gets returned with a refcount of 0.
  */
+static int __cc_remove_mapping(struct address_space *mapping, struct folio *folio,
+			    bool reclaimed, struct mem_cgroup *target_memcg);
 static int __remove_mapping(struct address_space *mapping, struct folio *folio,
 			    bool reclaimed, struct mem_cgroup *target_memcg)
 {
 	int refcount;
 	void *shadow = NULL;
 	struct swap_cluster_info *ci;
+
+	if (cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages)))
+		return __cc_remove_mapping(mapping, folio, reclaimed, target_memcg);
 
 	BUG_ON(!folio_test_locked(folio));
 	BUG_ON(mapping != folio_mapping(folio));
@@ -770,6 +775,116 @@ cannot_free:
 		swap_cluster_unlock_irq(ci);
 	} else {
 		xa_unlock_irq(&mapping->i_pages);
+		spin_unlock(&mapping->host->i_lock);
+	}
+	return 0;
+}
+
+static int __cc_remove_mapping(struct address_space *mapping, struct folio *folio,
+			    bool reclaimed, struct mem_cgroup *target_memcg)
+{
+	int refcount;
+	void *shadow = NULL;
+	struct swap_cluster_info *ci;
+
+	BUG_ON(!folio_test_locked(folio));
+	BUG_ON(mapping != folio_mapping(folio));
+
+	if (folio_test_swapcache(folio)) {
+		ci = swap_cluster_get_and_lock_irq(folio);
+	} else {
+		spin_lock(&mapping->host->i_lock);
+		/*
+		 * cc_xarray stores do not take the i_pages lock.  Disable
+		 * interrupts as xa_lock_irq() would.
+		 */
+		local_irq_disable();
+	}
+
+	/*
+	 * The non racy check for a busy folio.
+	 *
+	 * Must be careful with the order of the tests. When someone has
+	 * a ref to the folio, it may be possible that they dirty it then
+	 * drop the reference. So if the dirty flag is tested before the
+	 * refcount here, then the following race may occur:
+	 *
+	 * get_user_pages(&page);
+	 * [user mapping goes away]
+	 * write_to(page);
+	 *				!folio_test_dirty(folio)    [good]
+	 * folio_set_dirty(folio);
+	 * folio_put(folio);
+	 *				!refcount(folio)   [good, discard it]
+	 *
+	 * [oops, our write_to data is lost]
+	 *
+	 * Reversing the order of the tests ensures such a situation cannot
+	 * escape unnoticed. The smp_rmb is needed to ensure the folio->flags
+	 * load is not satisfied before that of folio->_refcount.
+	 *
+	 * Note that if the dirty flag is always set via folio_mark_dirty,
+	 * and thus under the i_pages lock, then this ordering is not required.
+	 */
+	refcount = 1 + folio_nr_pages(folio);
+	if (!folio_ref_freeze(folio, refcount))
+		goto cannot_free;
+	/* note: atomic_cmpxchg in folio_ref_freeze provides the smp_rmb */
+	if (unlikely(folio_test_dirty(folio))) {
+		folio_ref_unfreeze(folio, refcount);
+		goto cannot_free;
+	}
+
+	if (folio_test_swapcache(folio)) {
+		swp_entry_t swap = folio->swap;
+
+		if (reclaimed && !mapping_exiting(mapping))
+			shadow = workingset_eviction(folio, target_memcg);
+		__memcg1_swapout(folio, ci);
+		__swap_cache_del_folio(ci, folio, swap, shadow);
+		swap_cluster_unlock_irq(ci);
+	} else {
+		void (*free_folio)(struct folio *);
+
+		free_folio = mapping->a_ops->free_folio;
+		/*
+		 * Remember a shadow entry for reclaimed file cache in
+		 * order to detect refaults, thus thrashing, later on.
+		 *
+		 * But don't store shadows in an address space that is
+		 * already exiting.  This is not just an optimization,
+		 * inode reclaim needs to empty out the radix tree or
+		 * the nodes are lost.  Don't plant shadows behind its
+		 * back.
+		 *
+		 * We also don't store shadows for DAX mappings because the
+		 * only page cache folios found in these are zero pages
+		 * covering holes, and because we don't want to mix DAX
+		 * exceptional entries and shadow exceptional entries in the
+		 * same address_space.
+		 */
+		if (reclaimed && folio_is_file_lru(folio) &&
+		    !mapping_exiting(mapping) && !dax_mapping(mapping))
+			shadow = workingset_eviction(folio, target_memcg);
+		preempt_disable();
+		__filemap_remove_folio(folio, shadow);
+		preempt_enable();
+		local_irq_enable();
+		if (mapping_shrinkable(mapping))
+			inode_lru_list_add(mapping->host);
+		spin_unlock(&mapping->host->i_lock);
+
+		if (free_folio)
+			free_folio(folio);
+	}
+
+	return 1;
+
+cannot_free:
+	if (folio_test_swapcache(folio)) {
+		swap_cluster_unlock_irq(ci);
+	} else {
+		local_irq_enable();
 		spin_unlock(&mapping->host->i_lock);
 	}
 	return 0;

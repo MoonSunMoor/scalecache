@@ -2393,6 +2393,11 @@ void tag_pages_for_writeback(struct address_space *mapping,
 	unsigned int tagged = 0;
 	void *page;
 
+	if (cc_xas_is_ccxarray(&xas)) {
+		cc_tag_pages_for_writeback(mapping, start, end);
+		return;
+	}
+
 	xas_lock_irq(&xas);
 	xas_for_each_marked(&xas, page, end, PAGECACHE_TAG_DIRTY) {
 		xas_set_mark(&xas, PAGECACHE_TAG_TOWRITE);
@@ -2407,6 +2412,29 @@ void tag_pages_for_writeback(struct address_space *mapping,
 	xas_unlock_irq(&xas);
 }
 EXPORT_SYMBOL(tag_pages_for_writeback);
+
+void cc_tag_pages_for_writeback(struct address_space *mapping,
+			     pgoff_t start, pgoff_t end)
+{
+	CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), start);
+	unsigned int tagged = 0;
+	void *page;
+
+	cc_xas_lock_irq(&xas);
+	cc_xas_for_each_marked(&xas, page, end, PAGECACHE_TAG_DIRTY) {
+		cc_xas_set_mark(&xas, PAGECACHE_TAG_TOWRITE);
+		if (++tagged % XA_CHECK_SCHED)
+			continue;
+
+		cc_xas_pause(&xas);
+		cc_xas_unlock_irq(&xas);
+		cond_resched();
+		cc_xas_lock_irq(&xas);
+	}
+	cc_xas_unlock_irq(&xas);
+	cc_xas_clear_xa_node(&xas);
+}
+EXPORT_SYMBOL(cc_tag_pages_for_writeback);
 
 static bool folio_prepare_writeback(struct address_space *mapping,
 		struct writeback_control *wbc, struct folio *folio)
@@ -2719,8 +2747,12 @@ void __folio_mark_dirty(struct folio *folio, struct address_space *mapping,
 	if (folio->mapping) {	/* Race with truncate? */
 		WARN_ON_ONCE(warn && !folio_test_uptodate(folio));
 		folio_account_dirtied(folio, mapping);
-		__xa_set_mark(&mapping->i_pages, folio->index,
-			      PAGECACHE_TAG_DIRTY);
+		if (cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages)))
+			__cc_xa_set_mark(CC_XARRAY(&mapping->i_pages),
+					 folio->index, PAGECACHE_TAG_DIRTY);
+		else
+			__xa_set_mark(&mapping->i_pages, folio->index,
+				      PAGECACHE_TAG_DIRTY);
 	}
 	xa_unlock_irqrestore(&mapping->i_pages, flags);
 }
@@ -3001,7 +3033,11 @@ bool __folio_end_writeback(struct folio *folio)
 
 		xa_lock_irqsave(&mapping->i_pages, flags);
 		ret = folio_xor_flags_has_waiters(folio, 1 << PG_writeback);
-		__xa_clear_mark(&mapping->i_pages, folio->index,
+		if (cc_xa_is_ccxarray(CC_XARRAY(&mapping->i_pages)))
+			__cc_xa_clear_mark(CC_XARRAY(&mapping->i_pages),
+					   folio->index, PAGECACHE_TAG_WRITEBACK);
+		else
+			__xa_clear_mark(&mapping->i_pages, folio->index,
 					PAGECACHE_TAG_WRITEBACK);
 
 		wb = inode_to_wb(inode);
@@ -3040,6 +3076,11 @@ void __folio_start_writeback(struct folio *folio, bool keep_write)
 		struct bdi_writeback *wb;
 		unsigned long flags;
 		bool on_wblist;
+
+		if (cc_xas_is_ccxarray(&xas)) {
+			__cc_folio_start_writeback(folio, keep_write);
+			return;
+		}
 
 		xas_lock_irqsave(&xas, flags);
 		xas_load(&xas);
@@ -3081,6 +3122,65 @@ void __folio_start_writeback(struct folio *folio, bool keep_write)
 	VM_BUG_ON_FOLIO(access_ret != 0, folio);
 }
 EXPORT_SYMBOL(__folio_start_writeback);
+
+void __cc_folio_start_writeback(struct folio *folio, bool keep_write)
+{
+	long nr = folio_nr_pages(folio);
+	struct address_space *mapping = folio_mapping(folio);
+	int access_ret;
+
+	VM_BUG_ON_FOLIO(folio_test_writeback(folio), folio);
+	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+
+	if (mapping && mapping_use_writeback_tags(mapping)) {
+		CC_XA_STATE(xas, CC_XARRAY(&mapping->i_pages), folio->index);
+		struct inode *inode = mapping->host;
+		struct bdi_writeback *wb;
+		unsigned long flags;
+		bool on_wblist;
+
+		cc_xas_lock_irqsave(&xas, flags);
+		cc_xas_load(&xas, false);
+		folio_test_set_writeback(folio);
+
+		on_wblist = mapping_tagged(mapping, PAGECACHE_TAG_WRITEBACK);
+
+		cc_xas_set_mark(&xas, PAGECACHE_TAG_WRITEBACK);
+		wb = inode_to_wb(inode);
+		wb_stat_mod(wb, WB_WRITEBACK, nr);
+		if (!on_wblist) {
+			wb_inode_writeback_start(wb);
+			/*
+			 * We can come through here when swapping anonymous
+			 * folios, so we don't necessarily have an inode to
+			 * track for sync.
+			 */
+			if (mapping->host)
+				sb_mark_inode_writeback(mapping->host);
+		}
+
+		if (!folio_test_dirty(folio))
+			cc_xas_clear_mark(&xas, PAGECACHE_TAG_DIRTY);
+		if (!keep_write)
+			cc_xas_clear_mark(&xas, PAGECACHE_TAG_TOWRITE);
+		cc_xas_rewind_refcnt(&xas);
+		cc_xas_clear_xa_node(&xas);
+		cc_xas_unlock_irqrestore(&xas, flags);
+	} else {
+		folio_test_set_writeback(folio);
+	}
+
+	lruvec_stat_mod_folio(folio, NR_WRITEBACK, nr);
+	zone_stat_mod_folio(folio, NR_ZONE_WRITE_PENDING, nr);
+
+	access_ret = arch_make_folio_accessible(folio);
+	/*
+	 * If writeback has been triggered on a page that cannot be made
+	 * accessible, it is too late to recover here.
+	 */
+	VM_BUG_ON_FOLIO(access_ret != 0, folio);
+}
+EXPORT_SYMBOL(__cc_folio_start_writeback);
 
 /**
  * folio_wait_writeback - Wait for a folio to finish writeback.

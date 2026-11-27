@@ -833,10 +833,15 @@ static __always_inline void SetPageUptodate(struct page *page)
 CLEARPAGEFLAG(Uptodate, uptodate, PF_NO_TAIL)
 
 void __folio_start_writeback(struct folio *folio, bool keep_write);
+void __cc_folio_start_writeback(struct folio *folio, bool keep_write);
+
 void set_page_writeback(struct page *page);
 
 #define folio_start_writeback(folio)			\
 	__folio_start_writeback(folio, false)
+
+#define cc_folio_start_writeback(folio)			\
+	__cc_folio_start_writeback(folio, false)
 
 static __always_inline bool folio_test_head(const struct folio *folio)
 {

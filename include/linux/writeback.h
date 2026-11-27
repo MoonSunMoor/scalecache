@@ -362,6 +362,8 @@ int do_writepages(struct address_space *mapping, struct writeback_control *wbc);
 void writeback_set_ratelimit(void);
 void tag_pages_for_writeback(struct address_space *mapping,
 			     pgoff_t start, pgoff_t end);
+void cc_tag_pages_for_writeback(struct address_space *mapping,
+			     pgoff_t start, pgoff_t end);
 
 bool filemap_dirty_folio(struct address_space *mapping, struct folio *folio);
 bool folio_redirty_for_writepage(struct writeback_control *, struct folio *);
