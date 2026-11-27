@@ -862,10 +862,13 @@ void cc_xas_create_range(struct cc_xa_state *xas)
 
 		for (;;) {
 			struct cc_xa_node *node = xas->xa_node;
+			unsigned char offset = node->offset;
+
+			/* Moving to the parent drops the reference to @node. */
 			//xas->xa_node = cc_xa_parent_locked(xas->xa, node);
 			cc_xas_set_xa_node(xas, cc_xa_parent_locked(xas->xa, node));
-			xas->xa_offset = node->offset - 1;
-			if (node->offset != 0)
+			xas->xa_offset = offset - 1;
+			if (offset != 0)
 				break;
 		}
 	}
@@ -1629,8 +1632,6 @@ void cc_xas_pause(struct cc_xa_state *xas)
 	if (cc_xas_invalid(xas))
 		return;
 
-	//xas->xa_node = CC_XAS_RESTART;
-	cc_xas_set_xa_node(xas, CC_XAS_RESTART);
 	if (node) {
 		unsigned long offset = xas->xa_offset;
 		while (++offset < CC_XA_CHUNK_SIZE) {
@@ -1639,12 +1640,18 @@ void cc_xas_pause(struct cc_xa_state *xas)
 		}
 		xas->xa_index &= ~0UL << node->shift;
 		xas->xa_index += (offset - xas->xa_offset) << node->shift;
-		if (xas->xa_index == 0)
-			//xas->xa_node = CC_XAS_BOUNDS;
-			cc_xas_set_xa_node(xas, CC_XAS_BOUNDS);
 	} else {
 		xas->xa_index++;
 	}
+
+	/*
+	 * Moving the cursor off @node drops its reference, and nothing else
+	 * keeps @node alive: finish reading it first.
+	 */
+	if (node && xas->xa_index == 0)
+		cc_xas_set_xa_node(xas, CC_XAS_BOUNDS);
+	else
+		cc_xas_set_xa_node(xas, CC_XAS_RESTART);
 }
 EXPORT_SYMBOL_GPL(cc_xas_pause);
 

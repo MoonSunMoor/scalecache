@@ -314,6 +314,14 @@ quiescent users, including no retained cursors/traversal references, and
 the paper's safe-point exclusion of new insertion/search/reuse.  Neither
 RCU nor taking ``xa_lock`` alone establishes this for lockless CC callers.
 
+A node reference is the only thing that keeps a CC node alive while a
+walker uses it.  Code in ``lib/cc_xarray.c`` therefore finishes reading a
+node before it moves the cursor off that node or unwinds the traversal
+reference that pins it, as ``cc_xas_pause()`` and ``cc_xas_create_range()``
+do.  ``cc_xas_delete_node()`` reads a node after dropping its own cursor
+reference while it holds the node's ``gc_flag``; a collector that frees
+nodes without the full safe point must exclude that window too.
+
 This cc-core port does not connect garbage collection to file release.
 Logical shadow cleanup therefore does not promise eventual physical
 reclamation.  A later integration must establish the safe point before
