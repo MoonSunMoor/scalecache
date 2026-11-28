@@ -635,6 +635,14 @@ static void cc_xas_free_nodes(struct cc_xa_state *xas, struct cc_xa_node *top)
  * Parent election makes a candidate shared before head publication.  Helpers
  * may publish it, but its election winner owns the update callback.  Shared
  * nodes retain the existing quiescent physical-reclamation requirement.
+ *
+ * The array-level marks summarise the marks of the head, and a new root
+ * takes them over in slot 0.  Mark updates hold xa_lock, so copying the
+ * marks and publishing the new root also happen under it, unless the
+ * caller already holds it.  Otherwise a mark update could fall between the
+ * copy and the publication and be lost, or leave the array-level marks
+ * disagreeing with the root.  Only growth above a non-empty head takes the
+ * lock; other stores stay lockless.
  */
 static int cc_xas_expand(struct cc_xa_state *xas, void **head)
 {
@@ -646,6 +654,7 @@ static int cc_xas_expand(struct cc_xa_state *xas, void **head)
 		struct cc_xa_node *node, *oldroot = NULL;
 		unsigned int shift = 0;
 		cc_xa_mark_t mark = 0;
+		unsigned long flags = 0;
 
 		if (cc_xa_is_node(old_head)) {
 			oldroot = cc_xa_to_node(old_head);
@@ -683,6 +692,8 @@ static int cc_xas_expand(struct cc_xa_state *xas, void **head)
 			node->nr_values = 1;
 		RCU_INIT_POINTER(node->slots[0], entry);
 
+		if (!xas->xa_lock_held)
+			cc_xa_lock_irqsave(xa, flags);
 		/* Propagate the aggregated mark info to the new child. */
 		for (;;) {
 			if (cc_xa_track_free(xa) && mark == CC_XA_FREE_MARK) {
@@ -710,6 +721,8 @@ static int cc_xas_expand(struct cc_xa_state *xas, void **head)
 				cc_xa_node_free(node);
 				(void)__sync_val_compare_and_swap(&xa->xa_head,
 						old_head, cc_xa_mk_node(root_parent));
+				if (!xas->xa_lock_held)
+					cc_xa_unlock_irqrestore(xa, flags);
 				continue;
 			}
 			/* A linked parent remains shared even if this CAS loses. */
@@ -717,9 +730,13 @@ static int cc_xas_expand(struct cc_xa_state *xas, void **head)
 						cc_xa_mk_node(node));
 		} else if (__sync_val_compare_and_swap(&xa->xa_head, old_head,
 						cc_xa_mk_node(node)) != old_head) {
+			if (!xas->xa_lock_held)
+				cc_xa_unlock_irqrestore(xa, flags);
 			cc_xa_node_free(node);
 			continue;
 		}
+		if (!xas->xa_lock_held)
+			cc_xa_unlock_irqrestore(xa, flags);
 		cc_xas_update(xas, node);
 		/* Reobserve the head instead of ascending an unpublished parent. */
 	}
@@ -2204,6 +2221,7 @@ void *__cc_xa_store(struct cc_xarray *xa, unsigned long index, void *entry, gfp_
 	if (cc_xa_track_free(xa) && !entry)
 		entry = CC_XA_ZERO_ENTRY;
 
+	xas.xa_lock_held = true;
 	do {
 		curr = cc_xas_store(&xas, entry);
 		if (cc_xa_track_free(xa))
@@ -2283,6 +2301,7 @@ static inline void *__cc_xa_cmpxchg_raw(struct cc_xarray *xa,
 	if (WARN_ON_ONCE(cc_xa_is_advanced(entry)))
 		return CC_XA_ERROR(-EINVAL);
 
+	xas.xa_lock_held = true;
 	do {
 		curr = cc_xas_load(&xas, false);
 		if (curr == old) {
@@ -2390,6 +2409,8 @@ void *cc_xa_store_range(struct cc_xarray *xa, unsigned long first,
 	if (last < first)
 		return CC_XA_ERROR(-EINVAL);
 
+	/* Stores run only between cc_xas_lock() and cc_xas_unlock() below. */
+	xas.xa_lock_held = true;
 	do {
 		cc_xas_lock(&xas);
 		if (entry) {
@@ -2531,6 +2552,7 @@ int __cc_xa_alloc(struct cc_xarray *xa, u32 *id, void *entry,
 	if (!entry)
 		entry = CC_XA_ZERO_ENTRY;
 
+	xas.xa_lock_held = true;
 	do {
 		xas.xa_index = limit.min;
 		cc_xas_find_marked(&xas, limit.max, CC_XA_FREE_MARK);
