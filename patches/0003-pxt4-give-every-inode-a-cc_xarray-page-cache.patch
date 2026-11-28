@@ -1,0 +1,49 @@
+From accde767d1ceb5a28f5b642ab62356bdc951ed6b Mon Sep 17 00:00:00 2001
+From: moonsunmoor <moonsunmoor@gmail.com>
+Date: Sat, 28 Nov 2026 05:16:16 +0000
+Subject: [PATCH 3/5] pxt4: give every inode a cc_xarray page cache
+
+Initialise i_pages of each pxt4 inode as a cc_xarray in the inode cache
+constructor, after inode_init_once().  The kernel's cc branches look at
+cc_xa_is_ccxarray() on the mapping, so this is what routes pxt4 page
+cache operations to ScaleCache.  The flags are those of the 6.6.8 pxt4,
+CC_XA_FLAGS_ACCOUNT without CC_XA_FLAGS_LOCK_IRQ.
+
+The 6.6.8 pxt4 called cc_inode_init_once(), a copy of inode_init_once()
+and __address_space_init_once() with the cc initialisation, instead.
+The copy missed spin_lock_init(&mapping->nr_lock) and printed a line for
+every inode it initialised.  Calling inode_init_once() and then
+re-initialising i_pages keeps the copy from drifting from the kernel.
+---
+ super.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/super.c b/super.c
+index 9871776..6318ee9 100644
+--- a/super.c
++++ b/super.c
+@@ -61,6 +61,8 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/pxt4.h>
+ 
++#include <linux/cc_xarray.h>
++
+ static struct pxt4_lazy_init *pxt4_li_info;
+ static DEFINE_MUTEX(pxt4_li_mtx);
+ static struct ratelimit_state pxt4_mount_msg_ratelimit;
+@@ -1491,6 +1493,12 @@ static void init_once(void *foo)
+ 	init_rwsem(&ei->xattr_sem);
+ 	init_rwsem(&ei->i_data_sem);
+ 	inode_init_once(&ei->vfs_inode);
++	/*
++	 * ScaleCache: the page cache of every pxt4 inode is a cc_xarray.
++	 * This is the only place where cc mappings are created.
++	 */
++	cc_xa_init_flags(CC_XARRAY(&ei->vfs_inode.i_data.i_pages),
++			 CC_XA_FLAGS_ACCOUNT);
+ 	pxt4_fc_init_inode(&ei->vfs_inode);
+ #ifdef CONFIG_FS_ENCRYPTION
+ 	ei->i_crypt_info = NULL;
+-- 
+2.25.1
+

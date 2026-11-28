@@ -1,0 +1,87 @@
+From d752c0471c6aaf55c7f5f88ba4795a900cd9e7b8 Mon Sep 17 00:00:00 2001
+From: moonsunmoor <moonsunmoor@gmail.com>
+Date: Sat, 28 Nov 2026 05:17:08 +0000
+Subject: [PATCH 5/5] pxt4: keep cc mappings at order 0 and without DAX
+
+The cc page cache of this port stores order-0 folios only and has no DAX
+entries (cc-core part 1, Documentation/core-api/cc-xarray.rst).  7.2.8
+ext4 turns large folios on by default and supports block sizes above
+PAGE_SIZE through them, so pxt4 has to turn both off:
+
+ - pxt4_check_large_folio() sets s_max_folio_order to 0, which makes
+   pxt4_set_inode_mapping_order() leave every mapping at order 0, and
+   refuses block sizes above PAGE_SIZE.  This also keeps khugepaged
+   away, as file_thp_enabled() needs mapping_pmd_folio_support().
+ - The dax, dax=always and dax=inode mount options fail, and
+   pxt4_should_enable_dax() is false for a cc mapping, so the per-inode
+   DAX flag has no effect either.
+
+The upstream code is left in place; part 2 (large folios) removes the
+order 0 limit.
+---
+ inode.c |  5 +++++
+ super.c | 18 ++++++++++++++++++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/inode.c b/inode.c
+index a669c58..9d94561 100644
+--- a/inode.c
++++ b/inode.c
+@@ -52,6 +52,8 @@
+ 
+ #include <trace/events/pxt4.h>
+ 
++#include <linux/cc_xarray.h>
++
+ static void pxt4_journalled_zero_new_buffers(handle_t *handle,
+ 					    struct inode *inode,
+ 					    struct folio *folio,
+@@ -5111,6 +5113,9 @@ static bool pxt4_should_enable_dax(struct inode *inode)
+ {
+ 	struct pxt4_sb_info *sbi = PXT4_SB(inode->i_sb);
+ 
++	/* ScaleCache: cc mappings do not hold DAX entries. */
++	if (cc_xa_is_ccxarray(CC_XARRAY(&inode->i_data.i_pages)))
++		return false;
+ 	if (test_opt2(inode->i_sb, DAX_NEVER))
+ 		return false;
+ 	if (!S_ISREG(inode->i_mode))
+diff --git a/super.c b/super.c
+index e37bb49..4bd8259 100644
+--- a/super.c
++++ b/super.c
+@@ -2385,6 +2385,12 @@ static int pxt4_parse_param(struct fs_context *fc, struct fs_parameter *param)
+ 		int type = (token == Opt_dax) ?
+ 			   Opt_dax : result.uint_32;
+ 
++		/* ScaleCache: cc mappings do not hold DAX entries. */
++		if (type != Opt_dax_never) {
++			pxt4_msg(NULL, KERN_ERR, "DAX unsupported for ScaleCache");
++			return -EINVAL;
++		}
++
+ 		switch (type) {
+ 		case Opt_dax:
+ 		case Opt_dax_always:
+@@ -5130,6 +5136,18 @@ static int pxt4_check_large_folio(struct super_block *sb)
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * ScaleCache: cc mappings hold order-0 folios only, so keep every
++	 * mapping at order 0 and refuse block sizes above PAGE_SIZE, which
++	 * need large folios.
++	 */
++	if (sb->s_blocksize > PAGE_SIZE) {
++		pxt4_msg(sb, KERN_ERR, "bs(%lu) > ps(%lu) unsupported for ScaleCache",
++			 sb->s_blocksize, PAGE_SIZE);
++		return -EINVAL;
++	}
++	PXT4_SB(sb)->s_max_folio_order = 0;
++
+ 	return 0;
+ }
+ 
+-- 
+2.25.1
+

@@ -1,0 +1,68 @@
+From 24f83d0f8a3307dce26258b79571c135b5fe1e14 Mon Sep 17 00:00:00 2001
+From: moonsunmoor <moonsunmoor@gmail.com>
+Date: Sat, 28 Nov 2026 05:24:12 +0000
+Subject: [PATCH 2/5] pxt4: give the slab caches named after structs a pxt4
+ name
+
+KMEM_CACHE() names a cache after its struct, so the rename leaves
+extent_status, pending_reservation and bio_post_read_ctx with the names
+of the ext4 caches.  With ext4 loaded too, kmem_cache_sanity_check()
+warns "kmem_cache of name 'extent_status' already exists" when pxt4 is
+loaded (CONFIG_DEBUG_VM), and slabinfo shows two caches of each name.
+Create the three with kmem_cache_create() and a pxt4_ name, with the
+size, alignment and flags that KMEM_CACHE() gave them.  The other pxt4
+and jbd3 caches already have pxt4 or jbd3 in their names.
+
+The 6.6.8 pxt4 had the same duplicates.
+---
+ extents_status.c | 10 ++++++++--
+ readpage.c       |  5 ++++-
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/extents_status.c b/extents_status.c
+index 7b54ff0..3b5e90e 100644
+--- a/extents_status.c
++++ b/extents_status.c
+@@ -191,7 +191,10 @@ static int __revise_pending(struct inode *inode, pxt4_lblk_t lblk,
+ 
+ int __init pxt4_init_es(void)
+ {
+-	pxt4_es_cachep = KMEM_CACHE(extent_status, SLAB_RECLAIM_ACCOUNT);
++	pxt4_es_cachep = kmem_cache_create("pxt4_extent_status",
++					   sizeof(struct extent_status),
++					   __alignof__(struct extent_status),
++					   SLAB_RECLAIM_ACCOUNT, NULL);
+ 	if (pxt4_es_cachep == NULL)
+ 		return -ENOMEM;
+ 	return 0;
+@@ -2014,7 +2017,10 @@ static void pxt4_print_pending_tree(struct inode *inode)
+ 
+ int __init pxt4_init_pending(void)
+ {
+-	pxt4_pending_cachep = KMEM_CACHE(pending_reservation, SLAB_RECLAIM_ACCOUNT);
++	pxt4_pending_cachep = kmem_cache_create("pxt4_pending_reservation",
++					sizeof(struct pending_reservation),
++					__alignof__(struct pending_reservation),
++					SLAB_RECLAIM_ACCOUNT, NULL);
+ 	if (pxt4_pending_cachep == NULL)
+ 		return -ENOMEM;
+ 	return 0;
+diff --git a/readpage.c b/readpage.c
+index 55ac625..d98fe15 100644
+--- a/readpage.c
++++ b/readpage.c
+@@ -431,7 +431,10 @@ void pxt4_readahead(struct readahead_control *rac)
+ 
+ int __init pxt4_init_post_read_processing(void)
+ {
+-	bio_post_read_ctx_cache = KMEM_CACHE(bio_post_read_ctx, SLAB_RECLAIM_ACCOUNT);
++	bio_post_read_ctx_cache = kmem_cache_create("pxt4_bio_post_read_ctx",
++					    sizeof(struct bio_post_read_ctx),
++					    __alignof__(struct bio_post_read_ctx),
++					    SLAB_RECLAIM_ACCOUNT, NULL);
+ 
+ 	if (!bio_post_read_ctx_cache)
+ 		goto fail;
+-- 
+2.25.1
+
