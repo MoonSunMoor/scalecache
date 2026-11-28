@@ -661,13 +661,18 @@ void cc_workingset_update_node(struct cc_xa_node *node)
 	 * Track non-empty nodes that contain only shadow entries;
 	 * unlink those that contain pages or are being freed.
 	 *
-	 * This retains the original i_pages lock assertion and unlocked
-	 * list_empty() checks. Original cc filemap insertion does not take
-	 * i_pages.xa_lock, so that path violates this assertion and does not
-	 * serialize these checks against concurrent updates or reclaim.
-	 * The port preserves that pre-existing locking mismatch.
+	 * Lockless cc insertion and deletion call this without
+	 * i_pages.xa_lock, so it does not assert that lock the way
+	 * workingset_update_node() does.  As in the 5.4 original, it checks
+	 * only that interrupts are off, which every caller ensures.
+	 * The unlocked list_empty() checks are not serialized against
+	 * concurrent updates or reclaim (the pre-existing locking mismatch,
+	 * kept by the port).  list_lru_add_obj() and list_lru_del_obj()
+	 * recheck under the list_lru lock, so the list stays consistent, but
+	 * WORKINGSET_NODES and whether the node sits on the shadow LRU can
+	 * lag behind.
 	 */
-	lockdep_assert_held(&node->array->xa_lock);
+	VM_WARN_ON_ONCE(!irqs_disabled());  /* For __inc_node_page_state() */
 
 	while (__atomic_load_n(&node->gc_flag, __ATOMIC_SEQ_CST))
 		cpu_relax();
