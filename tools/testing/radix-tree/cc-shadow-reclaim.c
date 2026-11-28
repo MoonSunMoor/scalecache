@@ -128,6 +128,10 @@ static unsigned int observed_clear(struct cc_xa_state *xas)
 	return cleared_slots;
 }
 
+/* No kernel IRQ context here, so every caller counts as having IRQs off. */
+#define irqs_disabled() true
+#define VM_WARN_ON_ONCE(cond) CHECK(!(cond))
+
 #undef spin_unlock
 #define spin_unlock(lock) scheduled_unlock(lock)
 #define xa_delete_node(node, update) scheduled_delete(node, update)

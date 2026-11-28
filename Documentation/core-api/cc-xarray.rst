@@ -70,11 +70,17 @@ with ``cc_xas_set_update()``.  Generic convenience wrappers do not install
 the page-cache callback on behalf of the caller.
 
 The callback updates the shadow-node LRU, not the entry's lifetime.
-Its existing ``xa_lock`` assertion and list checks conflict with original
-CC filemap insertion, which does not take that lock.  This inherited
-mismatch is not resolved by this port.  Installing the callback is
-necessary, but is not proof that all callback/list-LRU races are excluded.
-Do not silently add a new global locking requirement to the CC copies.
+Original CC filemap insertion and deletion call it without ``xa_lock``, so
+``cc_workingset_update_node()`` does not assert that lock, unlike
+``workingset_update_node()``.  As in the original CC code, it checks only
+that interrupts are disabled, which its per-CPU counter updates expect and
+every caller ensures.  Its list checks are not serialized against
+concurrent updates or reclaim; the list_lru functions recheck under their
+own lock, so the list stays consistent, but the shadow-node count and LRU
+placement can lag.  This inherited mismatch is not resolved by this port.
+Installing the callback is necessary, but is not proof that all
+callback/list-LRU races are excluded.  Do not silently add a new global
+locking requirement to the CC copies.
 
 Operation state and reference ownership
 =======================================
