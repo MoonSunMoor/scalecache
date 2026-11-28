@@ -1330,6 +1330,10 @@ typedef void (*cc_xa_update_node_t)(struct cc_xa_node *node);
  * position in the tree of nodes for this operation.  If an error occurs
  * during an operation, it is set to an %CC_XAS_ERROR value.  If we run off the
  * end of the allocated nodes, it is set to %CC_XAS_BOUNDS.
+ *
+ * @xa_lock_held is set by a caller that holds xa_lock across a store which
+ * may grow the tree.  Growth then does not take xa_lock itself.  The locked
+ * cc_xa_* functions set it for their own state.
  */
 struct cc_xa_state {
 	struct cc_xarray *xa;
@@ -1347,6 +1351,7 @@ struct cc_xa_state {
 	struct cc_xa_node *trace_root;	/* Node trace root */
 	struct cc_xa_node *trace_leaf;	/* Node trace leaf */
 	int nr_refget;			/* Counter for get_node */
+	bool xa_lock_held;		/* The caller holds xa_lock */
 };
 
 /*
@@ -1370,6 +1375,7 @@ struct cc_xa_state {
 	.trace_root = NULL,					\
 	.trace_leaf = NULL,					\
 	.nr_refget = 0,						\
+	.xa_lock_held = false,					\
 }
 
 /**

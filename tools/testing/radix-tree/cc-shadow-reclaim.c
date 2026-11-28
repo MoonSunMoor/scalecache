@@ -180,6 +180,7 @@ static void put(unsigned long index, void *entry)
 	CC_XA_STATE(xas, CC_XARRAY(&mapping.i_pages), index);
 
 	cc_xas_set_update(&xas, cc_workingset_update_node);
+	xas.xa_lock_held = !scanning;
 	do {
 		if (!scanning)
 			cc_xa_lock(xas.xa);
