@@ -2493,7 +2493,7 @@ long wb_do_writeback_modified(struct bdi_writeback *wb)
         wrote += wb_check_background_flush(wb);
         //wrote += wb_check_background_flush(wb);
 
-        if (__sync_sub_and_fetch(&wb->nr_threads, 1))
+        if (!__sync_sub_and_fetch(&wb->nr_threads, 1))
                 clear_bit(WB_writeback_running, &wb->state);
 
         return wrote;
