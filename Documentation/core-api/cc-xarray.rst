@@ -57,6 +57,22 @@ and the ordinary XArray branch for non-CC mappings.
 caller to hold that lock; check the individual function's contract.
 These locks do not exclude lockless advanced CC writers.
 
+Mark updates hold ``xa_lock``, as the CC branches of
+``__folio_mark_dirty()`` and ``__folio_end_writeback()``,
+``__cc_folio_start_writeback()`` and ``cc_tag_pages_for_writeback()`` do.
+The array-level marks summarise the marks of the head, and growth copies
+them into slot 0 of a new root before publishing it.  A store that adds a
+level above a non-empty head therefore takes ``xa_lock`` for the copy and
+the publication; stores that do not grow the tree stay lockless.  A caller
+that holds ``xa_lock`` across a store which may grow the tree sets
+``xas.xa_lock_held``, as the locked ``cc_xa_*`` functions do for their own
+state.  Without it, growth waits for the lock the caller holds.
+
+Lockless deletion does not follow this rule.  ``cc_xas_init_marks()`` and
+the mark clearing of a ``NULL`` store run without ``xa_lock``, so they are
+not serialized with mark updates or with growth.  This is inherited from
+the original deletion and is not resolved by this port.
+
 ``cc_xas_*`` advanced functions use a caller-owned ``struct cc_xa_state``.
 They do not uniformly acquire locks, release references, or encode errors
 in their return value.  Use the rules below rather than mechanically
